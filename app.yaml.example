@@ -4,6 +4,7 @@ modbus:
   timeout: 3
   addr: 0
   count: 4
+  modbus_retry_interval: 1.0
 
 mysql:
   host: "127.0.0.1"
@@ -16,13 +17,17 @@ mysql:
 redis:
   host: "127.0.0.1"
   port: 6379
-  # password: "" # redis有密码时启用
+  # password: ""
+  db: 0
+blacklist_ttl_sec: 300
 
+# 从站设备配置 key:slave_id，value:字节序标记，适配不同PLC高低字节序
+# 1=大端，2=小端，3=先调换寄存器再大端，4=先调换寄存器再小端
 slave_dict:
   1: 1
   2: 1
 
-# 基础配置（V2保留）
+# ========= V2 保留原有基础配置 =========
 txt_normal_path: "normal_record.txt"
 txt_alarm_path: "alarm_record.txt"
 txt_stat_path: "stat_record.txt"
@@ -33,7 +38,7 @@ stable_window_cnt: 3
 stable_threshold: 0.5
 alarm_interval: 300
 
-# V3新增配置
+# ========= V3 新增配置 =========
 stat_interval: 5
 heartbeat_interval: 10
 data_queue_maxsize: 1000
@@ -42,3 +47,17 @@ max_thread_retry: 3
 shutdown_max_wait: 10
 batch_data_max: 200
 mem_warn_threshold_mb: 300
+
+# ========= V4 新增配置项 =========
+max_workers: 8
+batch_insert_size: 200
+
+web:
+  host: "0.0.0.0"
+  port: 8000
+
+log:
+  level: "INFO"
+  file: "gateway.log"
+  max_size: 10485760
+  backup_count: 5
