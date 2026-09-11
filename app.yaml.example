@@ -4,6 +4,7 @@ modbus:
   timeout: 3
   addr: 0
   count: 4
+
 mysql:
   host: "127.0.0.1"
   port: 3306
@@ -11,10 +12,17 @@ mysql:
   password: "fill_your_password"
   database: "modbus_db"
   charset: "utf8mb4"
+
+redis:
+  host: "127.0.0.1"
+  port: 6379
+  # password: "" # redis有密码时启用
+
 slave_dict:
   1: 1
   2: 1
-# v2新增配置
+
+# 基础配置（V2保留）
 txt_normal_path: "normal_record.txt"
 txt_alarm_path: "alarm_record.txt"
 txt_stat_path: "stat_record.txt"
@@ -24,3 +32,13 @@ slave_offline_cnt: 3
 stable_window_cnt: 3
 stable_threshold: 0.5
 alarm_interval: 300
+
+# V3新增配置
+stat_interval: 5
+heartbeat_interval: 10
+data_queue_maxsize: 1000
+consumer_thread_num: 2
+max_thread_retry: 3
+shutdown_max_wait: 10
+batch_data_max: 200
+mem_warn_threshold_mb: 300
