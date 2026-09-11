@@ -4,6 +4,23 @@ modbus:
   timeout: 3
   addr: 0
   count: 4
+mysql:
+  host: "127.0.0.1"
+  port: 3306
+  user: "root"
+  password: "fill_your_password"
+  database: "modbus_db"
+  charset: "utf8mb4"
 slave_dict:
   1: 1
   2: 1
+# v2新增配置
+txt_normal_path: "normal_record.txt"
+txt_alarm_path: "alarm_record.txt"
+txt_stat_path: "stat_record.txt"
+cache_file: "offline_cache.json"
+slave_online_cnt: 2
+slave_offline_cnt: 3
+stable_window_cnt: 3
+stable_threshold: 0.5
+alarm_interval: 300
