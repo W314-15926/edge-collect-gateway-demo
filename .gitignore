@@ -1,0 +1,19 @@
+# 真实业务配置文件，禁止提交
+app.yaml
+
+# 日志文件
+*.log
+*.txt
+
+# 离线缓存json
+offline_cache.json
+
+# python缓存
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# 系统文件
+.DS_Store
+Thumbs.db
