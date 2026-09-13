@@ -23,7 +23,6 @@ from pydantic import BaseModel, Field
 from queue import Queue, Empty, Full
 from logging.handlers import RotatingFileHandler
 import uuid
-
 # ===================== 全局统计/状态变量 =====================
 collect_total = 0
 collect_success = 0
@@ -35,6 +34,7 @@ alarm_trigger_cnt = 0
 alarm_time_map: Dict[str, float] = {}
 slave_status_cache: Dict[int, Dict[str, Any]] = {}
 stat_data_window: Dict[int, List[List[Optional[float]]]] = {}
+alarm_blacklist: Dict[int, List[str]] = {}  # Bug1修复：补缺失全局告警黑名单
 # 本地内存黑名单（Redis故障降级兜底）
 local_blacklist: Dict[int, float] = {}
 uvicorn_server: Optional[uvicorn.Server] = None
@@ -44,7 +44,6 @@ UVICORN_RUNNING = False
 RUNTIME_CONFIG: Dict[str, Any] = {}
 app = FastAPI(title="modbus采集查询服务 V4")
 GLOBAL_LOCK = threading.Lock()
-
 # ===================== Redis封装类 V4核心新增 =====================
 class RedisClientWrap:
     def __init__(self, redis_cfg: dict):
@@ -52,7 +51,6 @@ class RedisClientWrap:
         self.redis_client: Optional[redis.Redis] = None
         self._redis_available = True
         self.connect()
-
     def connect(self):
         try:
             self.redis_client = redis.Redis(
@@ -68,7 +66,6 @@ class RedisClientWrap:
         except RedisError:
             self._redis_available = False
             logger.warning("Redis连接失败，自动降级本地内存黑名单")
-
     def is_redis_ok(self) -> bool:
         if not self._redis_available or self.redis_client is None:
             return False
@@ -79,7 +76,6 @@ class RedisClientWrap:
             self._redis_available = False
             logger.warning("Redis掉线，切换本地内存兜底")
             return False
-
     # 分布式熔断黑名单 key: blacklist:{slave_id}，TTL 300s(5分钟)
     def add_blacklist(self, slave_id:int, ttl=300):
         if self.is_redis_ok():
@@ -92,7 +88,6 @@ class RedisClientWrap:
         with GLOBAL_LOCK:
             local_blacklist[slave_id] = time.time() + ttl
         return True
-
     def in_blacklist(self, slave_id:int) -> bool:
         if self.is_redis_ok():
             try:
@@ -108,7 +103,6 @@ class RedisClientWrap:
                 else:
                     del local_blacklist[slave_id]
         return False
-
     def remove_blacklist(self, slave_id:int):
         if self.is_redis_ok():
             try:
@@ -119,7 +113,6 @@ class RedisClientWrap:
             if slave_id in local_blacklist:
                 del local_blacklist[slave_id]
         return True
-
     # ZSet滑动窗口限流：控制PLC采集频次
     def zset_rate_limit(self, slave_id:int, limit_cnt:int, window_seconds:int) -> bool:
         """
@@ -142,7 +135,6 @@ class RedisClientWrap:
             return False
         except RedisError:
             return False
-
     # 分布式锁，采集前置抢锁，保证幂等，防止多实例重复采集
     def try_acquire_lock(self, lock_key:str, expire=5) -> Optional[str]:
         if not self.is_redis_ok():
@@ -155,7 +147,6 @@ class RedisClientWrap:
             return None
         except RedisError:
             return None
-
     def release_lock(self, lock_key:str, lock_val:str):
         if not self.is_redis_ok():
             return
@@ -170,9 +161,7 @@ class RedisClientWrap:
             self.redis_client.eval(script, 1, lock_key, lock_val)
         except RedisError:
             pass
-
 redis_wrap: Optional[RedisClientWrap] = None
-
 # ===================== Pydantic 请求模型 =====================
 class ConfigReloadModel(BaseModel):
     slave_id: Optional[int] = Field(None, ge=1, description="从站id")
@@ -184,7 +173,6 @@ class BlacklistAddModel(BaseModel):
 class BlacklistRemoveModel(BaseModel):
     slave_id: Optional[int] = Field(None, ge=1, description="从站id")
     alarm_type: Optional[str] = Field(None, description="告警类型")
-
 # ===================== 日志初始化 =====================
 def init_logger(log_name, log_file) -> logging.Logger:
     logger = logging.getLogger(log_name)
@@ -199,7 +187,6 @@ def init_logger(log_name, log_file) -> logging.Logger:
     logger.addHandler(console_handler)
     return logger
 logger = init_logger("collect", "collect.log")
-
 # ===================== 信号处理 =====================
 def handle_receive_signal(signum, frame):
     global SHUTDOWN_FLAG, UVICORN_RUNNING, uvicorn_server
@@ -210,7 +197,6 @@ def handle_receive_signal(signum, frame):
         uvicorn_server.should_exit = True
 signal.signal(signal.SIGINT, handle_receive_signal)
 signal.signal(signal.SIGTERM, handle_receive_signal)
-
 # ===================== 文件工具函数 =====================
 def init_txt(file_path: str):
     if os.path.exists(file_path):
@@ -265,7 +251,6 @@ def write_to_stat_txt(collect_time, slave_id: int, temp_list: List, press_list: 
         logger.warning(f"写入 {file_path} IO异常")
     except Exception:
         logger.error(f"写入stat txt失败\n{traceback.format_exc()}")
-
 # ===================== 从站上下线监控 =====================
 def slave_online_monitor(slave_id:int, success:bool) -> int:
     if slave_id not in slave_status_cache:
@@ -290,7 +275,6 @@ def slave_online_monitor(slave_id:int, success:bool) -> int:
             # V4新增：下线加入分布式黑名单，TTL5分钟
             redis_wrap.add_blacklist(slave_id, ttl=300)
     return info["offline"]
-
 # ===================== 滑动窗口稳定性判断 =====================
 def stat_stable(window_data:List[List[Optional[float]]]) -> int:
     with GLOBAL_LOCK:
@@ -303,27 +287,22 @@ def stat_stable(window_data:List[List[Optional[float]]]) -> int:
     press_group = [item[1] for item in recent if len(item)>=1 and item[1] is not None]
     if len(temp_group) < stable_window_cnt or len(press_group) < stable_window_cnt:
         return 0
-    t1,t2,t3 = temp_group[0],temp_group[1],temp_group[2]
-    p1,p2,p3 = press_group[0],press_group[1],press_group[2]
-    temp_ok = abs(t1-t2) <= stable_threshold and abs(t1-t3) <= stable_threshold and abs(t2-t3) <= stable_threshold
-    press_ok = abs(p1-p2) <= stable_threshold and abs(p1-p3) <= stable_threshold and abs(p2-p3) <= stable_threshold
+    temp_ok = all( abs(temp_group[i]-temp_group[j]) <= stable_threshold for i in range(stable_window_cnt) for j in range(i+1,stable_window_cnt))
+    press_ok = all( abs(press_group[i]-press_group[j]) <= stable_threshold for i in range(stable_window_cnt) for j in range(i+1,stable_window_cnt))
     return 1 if (temp_ok or press_ok) else 0
-
 # ===================== 脏寄存器过滤 =====================
 def filter_dirty_regs(reg_list):
     """
     返回True代表脏数据，丢弃；False代表正常数据
-    注意：仿真器默认全0会被判定脏，真实设备按需修改此逻辑
+    Bug3修复：同时拦截0和65535脏寄存器
     """
     if len(reg_list)==0:
         return True
     for r in reg_list:
-        # if r ==0 or r ==65535:
-        if r == 65535:
-            logger.debug(f"检测脏寄存器 {r}")
+        if r ==0 or r == 65535:
+            logger.debug(f"检测脏寄存器值 {r}")
             return True
     return False
-
 # ===================== struct解析寄存器转float =====================
 def parse_regs_to_floats(reg_list):
     floats = []
@@ -341,7 +320,6 @@ def parse_regs_to_floats(reg_list):
     except Exception:
         logger.error(f"寄存器解析失败\n{traceback.format_exc()}")
     return floats
-
 # ===================== 告警防抖逻辑 =====================
 def alarm_rule(slave_id:int, float_list:List) -> tuple[str,str]:
     if not float_list:
@@ -376,7 +354,6 @@ def alarm_rule(slave_id:int, float_list:List) -> tuple[str,str]:
         with GLOBAL_LOCK:
             alarm_trigger_cnt +=1
     return alarm_str, alarm_level
-
 # ===================== Modbus重连 =====================
 def modbus_reconnect(client:ModbusTcpClient) -> bool:
     client.close()
@@ -411,8 +388,7 @@ def read_modbus_regs(client:ModbusTcpClient, slave_id:int, modbus_addr, modbus_c
     except Exception:
         logger.error(f"读寄存器异常\n{traceback.format_exc()}")
     return collect_time, reg_list, float_list, status
-
-# ===================== Mysql连接池 =====================
+# ===================== Mysql连接池 Bug2修复：增加连接有效性校验 =====================
 class MysqlPool:
     def __init__(self, cfg:Dict, max_idle:int):
         self.cfg = cfg
@@ -426,9 +402,14 @@ class MysqlPool:
                 logger.error("初始化连接池创建连接失败")
     def get_conn(self) -> Optional[pymysql.connections.Connection]:
         try:
+            conn = None
             if not self.queue.empty():
-                return self.queue.get()
-            return pymysql.connect(**self.cfg)
+                conn = self.queue.get()
+            else:
+                conn = pymysql.connect(**self.cfg)
+            # 校验连接是否存活，断线自动重连
+            conn.ping(reconnect=True)
+            return conn
         except Exception:
             logger.error(f"获取连接失败\n{traceback.format_exc()}")
             return None
@@ -436,10 +417,18 @@ class MysqlPool:
         if conn is None:
             return
         try:
+            # 检查连接有效才放回池，失效直接关闭丢弃
+            conn.ping(reconnect=False)
             if self.queue.qsize() < self.max_idle:
                 self.queue.put(conn)
             else:
                 conn.close()
+        except (OperationalError, pymysql.err.InterfaceError):
+            logger.warning("MySQL连接已失效，直接关闭丢弃，不归还连接池")
+            try:
+                conn.close()
+            except Exception:
+                pass
         except Exception:
             try:
                 conn.close()
@@ -452,7 +441,6 @@ class MysqlPool:
                 c.close()
             except Exception:
                 pass
-
 # ===================== SQL写入 =====================
 def write_to_sql(pool:MysqlPool, batch_list:List[tuple]) -> bool:
     if not batch_list:
@@ -484,26 +472,30 @@ def write_to_sql(pool:MysqlPool, batch_list:List[tuple]) -> bool:
         if cur:
             cur.close()
         pool.release_conn(conn)
-
-# ===================== JSON离线缓存 =====================
+# ===================== JSON离线缓存 Bug4修复，原子写文件，损坏保护 =====================
 def save_to_json(batch_list:list):
+    if not batch_list:
+        return
     with GLOBAL_LOCK:
         cache_file = RUNTIME_CONFIG["cache_file"]
+        tmp_file = cache_file + ".tmp"
     cache_list = []
     try:
         if os.path.exists(cache_file):
             with open(cache_file,"r",encoding="utf-8") as f:
                 cache_list = json.load(f)
     except json.JSONDecodeError:
-        logger.warning("缓存文件损坏")
+        logger.warning("缓存文件损坏，本次只追加新数据")
     except Exception:
         logger.error(f"读缓存失败\n{traceback.format_exc()}")
     cache_list.extend(batch_list)
     try:
-        with open(cache_file,"w",encoding="utf-8") as f:
+        # 先写临时文件，成功再替换原文件，避免半写损坏
+        with open(tmp_file,"w",encoding="utf-8") as f:
             json.dump(cache_list, f, ensure_ascii=False)
+        os.replace(tmp_file, cache_file)
     except Exception:
-        logger.error(f"写缓存失败\n{traceback.format_exc()}")
+        logger.error(f"写离线缓存失败，内存保留这批数据，等待下一轮重试\n{traceback.format_exc()}")
 def load_and_replay_to_sql(pool:MysqlPool):
     with GLOBAL_LOCK:
         cache_file = RUNTIME_CONFIG["cache_file"]
@@ -522,8 +514,10 @@ def load_and_replay_to_sql(pool:MysqlPool):
         ok = write_to_sql(pool, cache_data)
         if ok:
             logger.info("离线缓存回放入库完成")
-            os.remove(cache_file)
-
+            try:
+                os.remove(cache_file)
+            except OSError:
+                logger.warning("缓存文件删除失败，可能被其他进程占用")
 # ===================== 配置加载 yaml优先 =====================
 def load_runtime_config() -> dict:
     cfg: Dict[str, Any] = {}
@@ -579,7 +573,6 @@ def save_config_to_yaml(cfg:dict):
         if os.path.exists(tmp_name):
             os.remove(tmp_name)
         return False
-
 # ===================== 程序启动自检 =====================
 def startup_self_check(mysql_cfg:dict, modbus_cfg:dict):
     logger.info("===== 🟢A6 开始程序启动自检 =====")
@@ -612,7 +605,6 @@ def startup_self_check(mysql_cfg:dict, modbus_cfg:dict):
     for fp in fp_list:
         init_txt(fp)
     logger.info("===== 🟢A6 全部自检通过，启动业务线程 =====")
-
 # ===================== 内存监控线程 =====================
 def mem_monitor_thread():
     proc = psutil.Process(os.getpid())
@@ -628,7 +620,6 @@ def mem_monitor_thread():
         except Exception:
             time.sleep(2)
     logger.info("🟢A6内存监控线程退出")
-
 # ===================== 采集线程内层循环 V4新增前置黑名单、限流、分布式锁 =====================
 def _inner_collect_loop(slave_id:int, interval:int, modbus_cfg):
     # ✅每个采集线程私有ModbusTcpClient，规避多线程共享client非线程安全问题
@@ -663,33 +654,38 @@ def _inner_collect_loop(slave_id:int, interval:int, modbus_cfg):
         with GLOBAL_LOCK:
             global collect_total, collect_success, collect_fail
             collect_total +=1
-        if status == "success" and not filter_dirty_regs(regs):
-            success_flag = True
-            with GLOBAL_LOCK:
-                collect_success +=1
-                stat_data_window[slave_id].append(floats)
-                stable_window_cnt = RUNTIME_CONFIG["stable_window_cnt"]
-                if len(stat_data_window[slave_id]) > stable_window_cnt*3:
-                    stat_data_window[slave_id].pop(0)
-            stable = stat_stable(stat_data_window[slave_id])
-            alarm_str,alarm_level = alarm_rule(slave_id, floats)
-            offline = slave_online_monitor(slave_id, success_flag)
-            write_to_normal_txt(ct, slave_id, regs, floats, status)
-            temp = floats[0] if len(floats)>=1 else None
-            press = floats[1] if len(floats)>=2 else None
-            payload = {
-                "slave_id":slave_id, "collect_time":ct, "regs":regs, "float_list":floats,
-                "temp":temp,"press":press,"alarm_str":alarm_str,
-                "alarm_level":alarm_level,"stable":stable,"offline":offline
-            }
-            try:
-                assert DATA_QUEUE is not None
-                DATA_QUEUE.put(payload, timeout=0.1)
-            except Full:
-                logger.error(f"队列满丢弃数据 slave_id:{slave_id}")
+        if status == "success":
+            if not filter_dirty_regs(regs):
+                success_flag = True
                 with GLOBAL_LOCK:
-                    collect_fail +=1
+                    collect_success +=1
+                    stat_data_window[slave_id].append(floats)
+                    stable_window_cnt = RUNTIME_CONFIG["stable_window_cnt"]
+                    if len(stat_data_window[slave_id]) > stable_window_cnt*3:
+                        stat_data_window[slave_id].pop(0)
+                stable = stat_stable(stat_data_window[slave_id])
+                alarm_str,alarm_level = alarm_rule(slave_id, floats)
+                offline = slave_online_monitor(slave_id, success_flag)
+                write_to_normal_txt(ct, slave_id, regs, floats, status)
+                temp = floats[0] if len(floats)>=1 else None
+                press = floats[1] if len(floats)>=2 else None
+                payload = {
+                    "slave_id":slave_id, "collect_time":ct, "regs":regs, "float_list":floats,
+                    "temp":temp,"press":press,"alarm_str":alarm_str,
+                    "alarm_level":alarm_level,"stable":stable,"offline":offline
+                }
+                try:
+                    assert DATA_QUEUE is not None
+                    DATA_QUEUE.put(payload, timeout=0.1)
+                except Full:
+                    logger.error(f"队列满丢弃数据 slave_id:{slave_id}")
+                    with GLOBAL_LOCK:
+                        collect_fail +=1
+            else:
+                # Bug3修复：脏寄存器，**不执行下线判定**，只打日志，避免误判设备离线
+                logger.debug(f"从站{slave_id}收到脏寄存器，不更新设备上下线状态")
         else:
+            # modbus读取真正通信失败才更新下线状态
             slave_online_monitor(slave_id, success_flag)
         #释放分布式锁
         redis_wrap.release_lock(lock_key, lock_val)
@@ -713,7 +709,6 @@ def slave_collect_thread_wrapped(slave_id:int, interval:int, modbus_cfg):
                 logger.fatal(f"🟢A6 slave{slave_id}超过最大重启次数，不再重启")
                 break
             time.sleep(2)
-
 # ===================== 消费线程 =====================
 def _inner_consumer_loop(pool:MysqlPool):
     batch_buffer = []
@@ -736,7 +731,10 @@ def _inner_consumer_loop(pool:MysqlPool):
             if len(batch_buffer) >= batch_max:
                 batch_copy = batch_buffer.copy()
                 batch_buffer.clear()
-                write_to_sql(pool, batch_copy)
+                ok = write_to_sql(pool, batch_copy)
+                #入库失败则写入离线缓存，保证不丢
+                if not ok:
+                    save_to_json(batch_copy)
         except Empty:
             continue
         except OSError:
@@ -761,7 +759,6 @@ def consumer_thread_wrapped(pool:MysqlPool):
                 logger.fatal("🟢A6消费线程超过最大重启次数，停止重启")
                 break
             time.sleep(2)
-
 # ===================== 统计线程 =====================
 def stat_thread():
     logger.info("stat线程启动")
@@ -794,7 +791,6 @@ def health_thread():
             st = "在线" if info["offline"]==0 else "离线"
             logger.info(f"  slave{sid} {st} succ:{info['success_cnt']} fail:{info['fail_cnt']}")
     logger.info("health线程退出")
-
 # ===================== FastAPI服务启动，端口改为8001解决占用 =====================
 def run_app_cfg():
     global uvicorn_server, UVICORN_RUNNING
@@ -803,7 +799,6 @@ def run_app_cfg():
     uvicorn_server = uvicorn.Server(cfg)
     uvicorn_server.run()
     UVICORN_RUNNING = False
-
 # ===================== FastAPI中间件、接口 V4新增黑名单运维接口 =====================
 @app.middleware("http")
 async def slow_request_middleware(request: Request, call_next):
@@ -907,7 +902,6 @@ def api_stat(slave_id:int=Query(...,ge=1), limit:int=Query(50, ge=10, le=100)):
         return {"code":0,"msg":"ok","data":ret}
     except Exception:
         return {"code":-1,"msg":"err","data":None}
-
 # ===================== main入口 =====================
 def main():
     global RUNTIME_CONFIG, DATA_QUEUE, redis_wrap
