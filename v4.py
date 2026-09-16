@@ -38,13 +38,23 @@ stat_data_window: Dict[int, List[List[Optional[float]]]] = {}
 alarm_blacklist: Dict[int, List[str]] = {}  # Bug1修复：补缺失全局告警黑名单
 # 本地内存黑名单（Redis故障降级兜底）
 local_blacklist: Dict[int, float] = {}
+
 uvicorn_server: Optional[uvicorn.Server] = None
 DATA_QUEUE: Optional[Queue[Dict[str, Any]]] = None
 SHUTDOWN_FLAG = False
 UVICORN_RUNNING = False
 RUNTIME_CONFIG: Dict[str, Any] = {}
 app = FastAPI(title="modbus采集查询服务 V4")
-GLOBAL_LOCK = threading.Lock()
+
+# ========== 批次6：细粒度拆分锁，移除单一GLOBAL_LOCK大锁 ==========
+_lock_stats = threading.Lock()          # 采集统计计数器
+_lock_slave_status = threading.Lock()   # slave_status_cache 从站状态
+_lock_window = threading.Lock()         # stat_data_window 滑动窗口
+_lock_alarm = threading.Lock()          # alarm_time_map / alarm_blacklist 告警
+_lock_local_black = threading.Lock()    # local_blacklist redis降级内存黑名单
+_lock_runtime_cfg = threading.Lock()    # RUNTIME_CONFIG配置读取
+_lock_file_io = threading.Lock()        # txt文件写入（IO必须串行）
+_lock_json_cache = threading.Lock()      # 离线json缓存读写
 
 # ===================== Redis封装类 V4核心新增 =====================
 class RedisClientWrap:
@@ -89,8 +99,8 @@ class RedisClientWrap:
                 return True
             except RedisError:
                 pass
-        # 降级写入内存
-        with GLOBAL_LOCK:
+        # 降级写入内存，使用独立内存黑名单锁
+        with _lock_local_black:
             local_blacklist[slave_id] = time.time() + ttl
         return True
 
@@ -102,7 +112,7 @@ class RedisClientWrap:
             except RedisError:
                 pass
         # 读取本地内存黑名单
-        with GLOBAL_LOCK:
+        with _lock_local_black:
             if slave_id in local_blacklist:
                 if time.time() < local_blacklist[slave_id]:
                     return True
@@ -116,7 +126,7 @@ class RedisClientWrap:
                 self.redis_client.delete(f"blacklist:{slave_id}")
             except RedisError:
                 pass
-        with GLOBAL_LOCK:
+        with _lock_local_black:
             if slave_id in local_blacklist:
                 del local_blacklist[slave_id]
         return True
@@ -237,35 +247,38 @@ def init_txt(file_path: str) -> None:
 
 
 def write_to_normal_txt(collect_time: str, slave_id: int, reg_list: List[int], float_list: List[float], status: str) -> None:
-    with GLOBAL_LOCK:
+    with _lock_runtime_cfg:
         file_path = RUNTIME_CONFIG["txt_normal_path"]
     line = f"time:{collect_time},slave_id:{slave_id},reg_list:{reg_list},float_list:{float_list},status:{status}\n"
     init_txt(file_path)
-    try:
-        with open(file_path, "a", encoding="utf-8") as f:
-            f.write(line)
-    except OSError:
-        logger.warning(f"写入 {file_path} IO异常")
-    except Exception:
-        logger.error(f"写入普通txt失败\n{traceback.format_exc()}")
+    # 文件IO使用独立文件锁
+    with _lock_file_io:
+        try:
+            with open(file_path, "a", encoding="utf-8") as f:
+                f.write(line)
+        except OSError:
+            logger.warning(f"写入 {file_path} IO异常")
+        except Exception:
+            logger.error(f"写入普通txt失败\n{traceback.format_exc()}")
 
 
 def write_to_alarm_txt(collect_time: str, slave_id: int, float_list: List[float], alarm_str: str, alarm_level: str) -> None:
-    with GLOBAL_LOCK:
+    with _lock_runtime_cfg:
         file_path = RUNTIME_CONFIG["txt_alarm_path"]
     line = f"time:{collect_time},slave_id:{slave_id},float_list:{float_list},alarm_str:{alarm_str},alarm_level:{alarm_level}\n"
     init_txt(file_path)
-    try:
-        with open(file_path, "a", encoding="utf-8") as f:
-            f.write(line)
-    except OSError:
-        logger.warning(f"写入 {file_path} IO异常")
-    except Exception:
-        logger.error(f"写入告警txt失败\n{traceback.format_exc()}")
+    with _lock_file_io:
+        try:
+            with open(file_path, "a", encoding="utf-8") as f:
+                f.write(line)
+        except OSError:
+            logger.warning(f"写入 {file_path} IO异常")
+        except Exception:
+            logger.error(f"写入告警txt失败\n{traceback.format_exc()}")
 
 
 def write_to_stat_txt(collect_time: str, slave_id: int, temp_list: List[float], press_list: List[float]) -> None:
-    with GLOBAL_LOCK:
+    with _lock_runtime_cfg:
         file_path = RUNTIME_CONFIG["txt_stat_path"]
     init_txt(file_path)
     lines: List[str] = []
@@ -275,43 +288,48 @@ def write_to_stat_txt(collect_time: str, slave_id: int, temp_list: List[float], 
     if len(press_list) > 0:
         p_max, p_min, p_ave = max(press_list), min(press_list), round(sum(press_list) / len(press_list), 2)
         lines.append(f"time:{collect_time},slave_id:{slave_id},press_max:{p_max},press_min:{p_min},press_ave:{p_ave}\n")
-    try:
-        with open(file_path, "a", encoding="utf-8") as f:
-            f.writelines(lines)
-    except OSError:
-        logger.warning(f"写入 {file_path} IO异常")
-    except Exception:
-        logger.error(f"写入stat txt失败\n{traceback.format_exc()}")
+    with _lock_file_io:
+        try:
+            with open(file_path, "a", encoding="utf-8") as f:
+                f.writelines(lines)
+        except OSError:
+            logger.warning(f"写入 {file_path} IO异常")
+        except Exception:
+            logger.error(f"写入stat txt失败\n{traceback.format_exc()}")
 
-# ===================== 从站上下线监控（批次5原有逻辑不动） =====================
+# ===================== 从站上下线监控（批次5原有逻辑不动，更换锁） =====================
 def slave_online_monitor(slave_id: int, success: bool) -> int:
-    if slave_id not in slave_status_cache:
-        with GLOBAL_LOCK:
+    with _lock_slave_status:
+        if slave_id not in slave_status_cache:
             slave_status_cache[slave_id] = {"success_cnt": 0, "fail_cnt": 0, "offline": 0}
-    info = slave_status_cache[slave_id]
-    with GLOBAL_LOCK:
+        info = slave_status_cache[slave_id]
+    with _lock_runtime_cfg:
         slave_online_cnt = RUNTIME_CONFIG["slave_online_cnt"]
         slave_offline_cnt = RUNTIME_CONFIG["slave_offline_cnt"]
+
     if success:
-        info["success_cnt"] += 1
-        info["fail_cnt"] = 0
-        if info["offline"] == 1 and info["success_cnt"] >= slave_online_cnt:
-            info["offline"] = 0
-            logger.info(f"从站{slave_id}恢复上线")
+        with _lock_slave_status:
+            info["success_cnt"] += 1
+            info["fail_cnt"] = 0
+            if info["offline"] == 1 and info["success_cnt"] >= slave_online_cnt:
+                info["offline"] = 0
+                logger.info(f"从站{slave_id}恢复上线")
     else:
-        info["fail_cnt"] += 1
-        info["success_cnt"] = 0
-        if info["offline"] == 0 and info["fail_cnt"] >= slave_offline_cnt:
-            info["offline"] = 1
-            logger.info(f"从站{slave_id}下线")
-            # V4新增：下线加入分布式黑名单，TTL5分钟
-            if redis_wrap is not None:
-                redis_wrap.add_blacklist(slave_id, ttl=300)
-    return info["offline"]
+        with _lock_slave_status:
+            info["fail_cnt"] += 1
+            info["success_cnt"] = 0
+            if info["offline"] == 0 and info["fail_cnt"] >= slave_offline_cnt:
+                info["offline"] = 1
+                logger.info(f"从站{slave_id}下线")
+        # V4新增：下线加入分布式黑名单，TTL5分钟
+        if redis_wrap is not None:
+            redis_wrap.add_blacklist(slave_id, ttl=300)
+    with _lock_slave_status:
+        return info["offline"]
 
 # ===================== 滑动窗口稳定性判断 =====================
 def stat_stable(window_data: List[List[Optional[float]]]) -> int:
-    with GLOBAL_LOCK:
+    with _lock_runtime_cfg:
         stable_window_cnt = RUNTIME_CONFIG["stable_window_cnt"]
         stable_threshold = RUNTIME_CONFIG["stable_threshold"]
     if len(window_data) < stable_window_cnt:
@@ -367,18 +385,21 @@ def alarm_rule(slave_id: int, float_list: List[float]) -> Tuple[str, str]:
     collect_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
     temp = float_list[0] if len(float_list) >= 1 else None
     press = float_list[1] if len(float_list) >= 2 else None
-    with GLOBAL_LOCK:
+    with _lock_runtime_cfg:
         alarm_interval = RUNTIME_CONFIG["alarm_interval"]
+
     if temp is not None and temp > 50:
         key = f"{slave_id}_temp"
-        if key not in alarm_time_map or now_ts - alarm_time_map[key] > alarm_interval:
-            alarm_info.append("温度过高")
-            alarm_time_map[key] = now_ts
+        with _lock_alarm:
+            if key not in alarm_time_map or now_ts - alarm_time_map[key] > alarm_interval:
+                alarm_info.append("温度过高")
+                alarm_time_map[key] = now_ts
     if press is not None and press < 0:
         key = f"{slave_id}_press"
-        if key not in alarm_time_map or now_ts - alarm_time_map[key] > alarm_interval:
-            alarm_info.append("压力过低")
-            alarm_time_map[key] = now_ts
+        with _lock_alarm:
+            if key not in alarm_time_map or now_ts - alarm_time_map[key] > alarm_interval:
+                alarm_info.append("压力过低")
+                alarm_time_map[key] = now_ts
     alarm_str = "、".join(alarm_info)
     if "温度过高" in alarm_str:
         alarm_level = "一级警报"
@@ -388,7 +409,7 @@ def alarm_rule(slave_id: int, float_list: List[float]) -> Tuple[str, str]:
         logger.info(f"{collect_time} 从站{slave_id} {alarm_str} {alarm_level}")
         write_to_alarm_txt(collect_time, slave_id, float_list, alarm_str, alarm_level)
         global alarm_trigger_cnt
-        with GLOBAL_LOCK:
+        with _lock_stats:
             alarm_trigger_cnt += 1
     return alarm_str, alarm_level
 
@@ -518,40 +539,43 @@ def write_to_sql(pool: MysqlPool, batch_list: List[tuple]) -> bool:
             cur.close()
         pool.release_conn(conn)
 
-# ===================== JSON离线缓存 Bug4修复保留不动 =====================
+# ===================== JSON离线缓存 Bug4修复保留不动，更换独立锁 =====================
 def save_to_json(batch_list: list) -> None:
     if not batch_list:
         return
-    with GLOBAL_LOCK:
+    with _lock_runtime_cfg:
         cache_file = RUNTIME_CONFIG["cache_file"]
         tmp_file = cache_file + ".tmp"
     cache_list = []
     try:
         if os.path.exists(cache_file):
-            with open(cache_file, "r", encoding="utf-8") as f:
-                cache_list = json.load(f)
+            with _lock_json_cache:
+                with open(cache_file, "r", encoding="utf-8") as f:
+                    cache_list = json.load(f)
     except json.JSONDecodeError:
         logger.warning("缓存文件损坏，本次只追加新数据")
     except Exception:
         logger.error(f"读缓存失败\n{traceback.format_exc()}")
     cache_list.extend(batch_list)
     try:
-        # 先写临时文件，成功再替换原文件，避免半写损坏
-        with open(tmp_file, "w", encoding="utf-8") as f:
-            json.dump(cache_list, f, ensure_ascii=False)
-        os.replace(tmp_file, cache_file)
+        with _lock_json_cache:
+            # 先写临时文件，成功再替换原文件，避免半写损坏
+            with open(tmp_file, "w", encoding="utf-8") as f:
+                json.dump(cache_list, f, ensure_ascii=False)
+            os.replace(tmp_file, cache_file)
     except Exception:
         logger.error(f"写离线缓存失败，内存保留这批数据，等待下一轮重试\n{traceback.format_exc()}")
 
 
 def load_and_replay_to_sql(pool: MysqlPool) -> None:
-    with GLOBAL_LOCK:
+    with _lock_runtime_cfg:
         cache_file = RUNTIME_CONFIG["cache_file"]
     if not os.path.exists(cache_file):
         return
     try:
-        with open(cache_file, "r", encoding="utf-8") as f:
-            cache_data = json.load(f)
+        with _lock_json_cache:
+            with open(cache_file, "r", encoding="utf-8") as f:
+                cache_data = json.load(f)
     except json.JSONDecodeError:
         logger.warning("缓存文件损坏，跳过回放")
         return
@@ -649,7 +673,7 @@ def startup_self_check(mysql_cfg: dict, modbus_cfg: dict) -> None:
     if not c.connect():
         logger.warning("ModbusTCP连接测试失败；如果没有仿真PLC可以忽略此警告")
     c.close()
-    with GLOBAL_LOCK:
+    with _lock_runtime_cfg:
         fp_list = [
             RUNTIME_CONFIG["txt_normal_path"],
             RUNTIME_CONFIG["txt_alarm_path"],
@@ -667,7 +691,7 @@ def mem_monitor_thread() -> None:
         try:
             mem_info = proc.memory_info()
             rss_mb = mem_info.rss / 1024 / 1024
-            with GLOBAL_LOCK:
+            with _lock_runtime_cfg:
                 mem_thresh = RUNTIME_CONFIG["mem_warn_threshold_mb"]
                 if rss_mb > mem_thresh:
                     logger.warning(f"内存告警 当前RSS={rss_mb:.2f}MB 阈值={mem_thresh}MB")
@@ -676,13 +700,13 @@ def mem_monitor_thread() -> None:
             time.sleep(2)
     logger.info("内存监控线程退出")
 
-# ===================== 采集线程内层循环 批次5业务完全不动，增加redis_wrap判空 =====================
+# ===================== 采集线程内层循环 批次5业务完全不动；批次6更换细粒度锁 =====================
 def _inner_collect_loop(slave_id: int, interval: int, modbus_cfg: Dict[str, Any]) -> None:
     # ✅每个采集线程私有ModbusTcpClient，规避多线程共享client非线程安全问题
     client = ModbusTcpClient(host=modbus_cfg["host"], port=modbus_cfg["port"], timeout=modbus_cfg["timeout"])
     if not client.is_socket_open():
         modbus_reconnect(client)
-    with GLOBAL_LOCK:
+    with _lock_window:
         stat_data_window[slave_id] = []
     while not SHUTDOWN_FLAG:
         start_ts = time.time()
@@ -709,19 +733,25 @@ def _inner_collect_loop(slave_id: int, interval: int, modbus_cfg: Dict[str, Any]
         # ========== V4新增核心逻辑 END ==========
         ct, regs, floats, status = read_modbus_regs(client, slave_id, modbus_cfg["addr"], modbus_cfg["count"])
         success_flag = False
-        with GLOBAL_LOCK:
-            global collect_total, collect_success, collect_fail
+        with _lock_stats:
+            global collect_total
             collect_total += 1
         if status == "success":
             if not filter_dirty_regs(regs):
                 success_flag = True
-                with GLOBAL_LOCK:
+                with _lock_stats:
+                    global collect_success
                     collect_success += 1
+                with _lock_window:
                     stat_data_window[slave_id].append(floats)
-                    stable_window_cnt = RUNTIME_CONFIG["stable_window_cnt"]
+                    with _lock_runtime_cfg:
+                        stable_window_cnt = RUNTIME_CONFIG["stable_window_cnt"]
                     if len(stat_data_window[slave_id]) > stable_window_cnt * 3:
                         stat_data_window[slave_id].pop(0)
-                stable = stat_stable(stat_data_window[slave_id])
+                # 窗口拷贝已经在锁内完成，释放锁再做计算
+                with _lock_window:
+                    win_copy = stat_data_window[slave_id].copy()
+                stable = stat_stable(win_copy)
                 alarm_str, alarm_level = alarm_rule(slave_id, floats)
                 offline = slave_online_monitor(slave_id, success_flag)
                 write_to_normal_txt(ct, slave_id, regs, floats, status)
@@ -737,7 +767,8 @@ def _inner_collect_loop(slave_id: int, interval: int, modbus_cfg: Dict[str, Any]
                     DATA_QUEUE.put(payload, timeout=0.1)
                 except Full:
                     logger.error(f"队列满丢弃数据 slave_id:{slave_id}")
-                    with GLOBAL_LOCK:
+                    with _lock_stats:
+                        global collect_fail
                         collect_fail += 1
             else:
                 # Bug3修复：脏寄存器，**不执行下线判定**，只打日志，避免误判设备离线
@@ -756,7 +787,7 @@ def _inner_collect_loop(slave_id: int, interval: int, modbus_cfg: Dict[str, Any]
 
 
 def slave_collect_thread_wrapped(slave_id: int, interval: int, modbus_cfg: Dict[str, Any]) -> None:
-    with GLOBAL_LOCK:
+    with _lock_runtime_cfg:
         max_thread_retry = RUNTIME_CONFIG["max_thread_retry"]
     retry_cnt = 0
     while not SHUTDOWN_FLAG:
@@ -788,7 +819,7 @@ def _inner_consumer_loop(pool: MysqlPool) -> None:
                 item["offline"], "success", item["stable"]
             )
             batch_buffer.append(row_tuple)
-            with GLOBAL_LOCK:
+            with _lock_runtime_cfg:
                 batch_max = RUNTIME_CONFIG["batch_data_max"]
             if len(batch_buffer) >= batch_max:
                 batch_copy = batch_buffer.copy()
@@ -809,7 +840,7 @@ def _inner_consumer_loop(pool: MysqlPool) -> None:
 
 
 def consumer_thread_wrapped(pool: MysqlPool) -> None:
-    with GLOBAL_LOCK:
+    with _lock_runtime_cfg:
         max_thread_retry = RUNTIME_CONFIG["max_thread_retry"]
     retry_cnt = 0
     while not SHUTDOWN_FLAG:
@@ -830,8 +861,9 @@ def stat_thread() -> None:
     while not SHUTDOWN_FLAG:
         start_ts = time.time()
         ct = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-        with GLOBAL_LOCK:
+        with _lock_runtime_cfg:
             stat_interval = RUNTIME_CONFIG["stat_interval"]
+        with _lock_window:
             win_copy = stat_data_window.copy()
         for sid, rec in win_copy.items():
             t_list = [x[0] for x in rec if len(x) >= 1 and x[0] is not None]
@@ -839,19 +871,24 @@ def stat_thread() -> None:
             write_to_stat_txt(ct, sid, t_list, p_list)
         cost = time.time() - start_ts
         sleep_t = max(0.01, stat_interval - cost)
-        time.sleep(sleep_t)
+        sleep_t = max(0.01, stat_interval - cost)
+        step = 0.2
+        while sleep_t > 0 and not SHUTDOWN_FLAG:
+            t_slp = min(step, sleep_t)
+            time.sleep(t_slp)
+            sleep_t -= t_slp
     logger.info("stat线程退出")
 
 
 def health_thread() -> None:
     logger.info("health线程启动")
     while not SHUTDOWN_FLAG:
-        with GLOBAL_LOCK:
+        with _lock_runtime_cfg:
             hb_int = RUNTIME_CONFIG["heartbeat_interval"]
         time.sleep(hb_int)
         assert DATA_QUEUE is not None
         q_size = DATA_QUEUE.qsize()
-        with GLOBAL_LOCK:
+        with _lock_slave_status:
             status_copy = slave_status_cache.copy()
         logger.info(f"[health]队列待处理:{q_size}")
         for sid, info in status_copy.items():
@@ -868,7 +905,7 @@ def run_app_cfg() -> None:
     uvicorn_server.run()
     UVICORN_RUNNING = False
 
-# ===================== FastAPI中间件、接口 批次5 Bug1修复保留 =====================
+# ===================== FastAPI中间件、接口 批次5 Bug1修复保留，更换锁 =====================
 @app.middleware("http")
 async def slow_request_middleware(request: Request, call_next):
     t0 = time.time()
@@ -889,7 +926,8 @@ async def health_live():
 async def health_ready():
     assert DATA_QUEUE is not None
     q_size = DATA_QUEUE.qsize()
-    mysql_cfg = RUNTIME_CONFIG["mysql"]
+    with _lock_runtime_cfg:
+        mysql_cfg = RUNTIME_CONFIG["mysql"]
     try:
         conn = pymysql.connect(**mysql_cfg)
         conn.close()
@@ -902,8 +940,7 @@ async def health_ready():
 
 @app.post("/api/config/save_yaml")
 async def api_save_yaml():
-    with GLOBAL_LOCK:
-        ok = save_config_to_yaml(RUNTIME_CONFIG)
+    ok = save_config_to_yaml(RUNTIME_CONFIG)
     if ok:
         return {"code": 0, "msg": "save yaml ok"}
     return {"code": -1, "msg": "save yaml fail"}
@@ -912,7 +949,7 @@ async def api_save_yaml():
 @app.get("/api/config/sta")
 def api_config_sta():
     try:
-        with GLOBAL_LOCK:
+        with _lock_runtime_cfg:
             d = RUNTIME_CONFIG.copy()
         return {"code": 0, "msg": "ok", "data": d}
     except Exception:
@@ -924,11 +961,12 @@ def api_blacklist_add(req: BlacklistAddModel):
     try:
         sid = req.slave_id
         at = req.alarm_type
-        if sid not in alarm_blacklist:
-            alarm_blacklist[sid] = []
-        if at and at not in alarm_blacklist[sid]:
-            alarm_blacklist[sid].append(at)
-        return {"code": 0, "msg": "ok", "data": alarm_blacklist}
+        with _lock_alarm:
+            if sid not in alarm_blacklist:
+                alarm_blacklist[sid] = []
+            if at and at not in alarm_blacklist[sid]:
+                alarm_blacklist[sid].append(at)
+            return {"code": 0, "msg": "ok", "data": alarm_blacklist.copy()}
     except Exception:
         return {"code": -1, "msg": "err", "data": None}
 
@@ -938,16 +976,17 @@ def api_blacklist_remove(req: BlacklistRemoveModel):
     try:
         sid = req.slave_id
         at = req.alarm_type
-        if sid in alarm_blacklist and at in alarm_blacklist[sid]:
-            alarm_blacklist[sid].remove(at)
-        return {"code": 0, "msg": "ok", "data": alarm_blacklist}
+        with _lock_alarm:
+            if sid in alarm_blacklist and at in alarm_blacklist[sid]:
+                alarm_blacklist[sid].remove(at)
+            return {"code": 0, "msg": "ok", "data": alarm_blacklist.copy()}
     except Exception:
         return {"code": -1, "msg": "err", "data": None}
 
 
 @app.get("/api/alarm/blacklist/sta")
 def api_blacklist_sta():
-    with GLOBAL_LOCK:
+    with _lock_alarm:
         return {"code": 0, "msg": "ok", "data": alarm_blacklist.copy()}
 
 
@@ -970,11 +1009,13 @@ def api_blacklist_manual_remove(slave_id: int = Query(..., ge=1)):
 @app.get("/api/stat")
 def api_stat(slave_id: int = Query(..., ge=1), limit: int = Query(50, ge=10, le=100)):
     try:
-        slave_dict = RUNTIME_CONFIG["slave_dict"]
+        with _lock_runtime_cfg:
+            slave_dict = RUNTIME_CONFIG["slave_dict"]
         if slave_id not in slave_dict:
             return {"code": -1, "msg": "slave not exist", "data": []}
-        with GLOBAL_LOCK:
+        with _lock_window:
             win_copy = stat_data_window.copy()
+        with _lock_slave_status:
             st_copy = slave_status_cache.copy()
         rec = st_copy.get(slave_id, {})
         last_temp, last_press = None, None
