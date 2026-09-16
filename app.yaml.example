@@ -17,10 +17,12 @@ mysql:
 redis:
   host: "127.0.0.1"
   port: 6379
+  decode_responses: true
   # password: ""
   db: 0
 
-# blacklist_ttl_sec: 300 #【预留，尚未实现；当前代码硬编码默认300秒】
+
+# blacklist_ttl_sec: 300 #【预留，尚未实现；代码硬编码默认300秒，暂不从yaml读取】
 
 # 从站设备配置 key: slave_id，value: 采集间隔(单位：秒)
 slave_dict:
@@ -60,6 +62,6 @@ mem_warn_threshold_mb: 300
 #   max_size: 10485760
 #   backup_count: 5
 
-# batch8说明：日志轮转目前代码硬编码：256MB，保留5份；yaml配置暂未实现
+# batch8说明：日志轮转参数代码硬编码(256MB，保留5份)，暂未接入yaml配置
 # log_max_bytes: 536870912
 # log_backup_count: 3
