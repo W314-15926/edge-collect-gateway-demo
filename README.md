@@ -7,19 +7,23 @@
 支持设备熔断黑名单、采集限流、本机采集防并发锁、告警防抖、离线本地缓存容错；
 对外提供FastAPI运维与查询接口，实现优雅停机。Redis为可选组件，Redis异常断开会自动降级使用内存兜底，不阻断主采集业务。
 
+## 测试环境说明
+> 本Demo**无真实工业PLC硬件**，开发与全部功能验证基于 Modbus‑Slave 模拟器模拟多台Modbus‑TCP从站设备完成。
+> 用于学习工业边缘采集的并发、容错、边界异常处理，不是商用生产版本。
+
 ## 技术栈
 Python3.9+ | FastAPI | pymodbus | pymysql | redis | threading | Queue | pyyaml
 
 ## ✨ 核心能力
 - Modbus‑TCP：每个从站独立采集线程，内置Modbus自动重连逻辑
-- 生产者‑消费者线程安全队列做缓冲，设置队列上限，队列满直接丢弃数据防止内存溢出
+- 生产者‑消费者线程安全队列做缓冲，设置队列上限，队列满直接丢弃最新数据并打印告警日志，防止内存溢出
 - 自定义MySQL连接池，增加连接有效性检测，自动处理数据库闪断、僵死失效连接
 - Redis实现：设备熔断黑名单、ZSet滑动窗口采集限流、**本机采集防并发锁**；Redis不可用时自动降级内存黑名单兜底
 - 业务容错：告警防抖、脏寄存器过滤、从站在线/离线状态判定
 - 离线容错：MySQL不可用时写入本地JSON缓存；数据库恢复后自动回放缓存数据入库
 - 日志：滚动文件日志，本地txt持久化采集记录、告警记录、统计数据
 - FastAPI接口：健康检查、运行统计查询、告警黑名单运维、配置管理，附带慢请求监控中间件
-- 优雅停机：捕获SIGINT / SIGTERM信号，等待业务线程安全退出
+- 优雅停机：捕获SIGINT / SIGTERM信号，等待正在执行的采集、入库任务完成后再退出程序
 
 ## 架构简述
 1. **采集层**：每台从站分配独立采集线程；采集前做黑名单、限流、本机防并发锁校验，读取寄存器后投递至线程安全队列。
@@ -29,20 +33,43 @@ Python3.9+ | FastAPI | pymodbus | pymysql | redis | threading | Queue | pyyaml
 5. **API层**：FastAPI提供运维、监控、数据查询HTTP接口。
 6. **后台辅助线程**：内存监控、设备健康巡检、指标统计线程，独立运行不阻塞主业务。
 
-## 快速启动
-1. 复制配置模板 `cp app.yaml.example app.yaml`，修改Modbus、MySQL、Redis连接配置
-2. 安装依赖
-```bash
-pip install -r requirements.txt
-3.执行 MySQL 建表 SQL，预先创建业务数据表 modbus_day2_data、modbus_history_backup
-4.运行程序
-bash
-python v4.py
+## 项目目录简要
+```tree
+edge-collect-gateway-demo
+├── v4.py                 # 程序主入口
+├── app.yaml.example      # 配置模板，复制为 app.yaml 使用
+├── bug_notes.md          # Bug记录：现象、排查、复现、修复验证
+├── requirements.txt      # 项目依赖
+├── src
+│   ├── gateway           # 采集核心逻辑，StateManager状态管理、设备轮询
+│   ├── pool              # MySQL自定义连接池实现、连接健康检测
+│   ├── api               # FastAPI 运维接口、慢请求中间件
+│   └── utils             # 日志轮转、信号处理、离线缓存、锁工具
+├── logs                  # 轮转日志输出目录
+└── offline_cache         # MySQL故障时本地JSON离线缓存目录
+```
 
-项目说明
-本项目为工业采集服务学习 Demo。
-Redis 锁仅用于本机多线程防重复采集，并未实现跨机器真正分布式锁（缺少锁续期、主从切换等逻辑）。
-线上故障修复记录、复现与验证方案查看 bug_notes.md。
-批次 6：已完成全局大锁拆分为多把业务细粒度锁，降低锁竞争
-批次 7：已实现 StateManager 统一收拢绝大多数业务状态
-后续待优化：进一步缩小锁临界区；收拢剩余顶层运行时全局对象
+## 测试说明
+功能验证：使用 Modbus‑Slave 模拟器构造正常数据、脏寄存器、设备断连重连等场景手动测试。
+故障注入测试：手动关停 MySQL、Redis 服务，验证降级逻辑、离线缓存、内存兜底是否生效。
+异常场景验证：程序 Ctrl+C 中断，验证 JSON 半写容错、优雅停机逻辑。
+
+## 快速启动
+复制配置模板 `cp app.yaml.example app.yaml`，修改 Modbus、MySQL、Redis 连接配置
+安装依赖
+```bash 
+pip install -r requirements.txt
+```
+执行 MySQL 建表 SQL，预先创建业务数据表 modbus_day2_data、modbus_history_backup
+运行程序
+```bash
+python v4.py
+```
+
+## 项目说明
+- 本项目为工业采集服务学习 Demo。
+- Redis 锁仅用于**本机多线程防重复采集**，并未实现跨机器真正分布式锁（缺少锁续期、主从切换等逻辑）。
+- 线上故障修复记录、复现与验证方案查看 bug_notes.md。
+- 批次 6：已完成全局大锁拆分为多把业务细粒度锁，降低锁竞争
+- 批次 7：已实现 StateManager 统一收拢绝大多数业务状态
+- 后续待优化：进一步缩小锁临界区；收拢剩余顶层运行时全局对象。
