@@ -63,7 +63,7 @@ pip install -r requirements.txt
 执行 MySQL 建表 SQL，预先创建业务数据表 modbus_day2_data、modbus_history_backup
 运行程序
 ```bash
-python v4.py
+python src/main.py
 ```
 
 ## 项目说明

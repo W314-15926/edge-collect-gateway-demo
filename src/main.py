@@ -24,6 +24,8 @@ from queue import Queue, Empty, Full
 from logging.handlers import RotatingFileHandler
 import uuid
 
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+yaml_file = os.path.join(BASE_DIR, "app.yaml")
 
 # ===================== 批次7：全局状态管理类 StateManager =====================
 class StateManager:
@@ -601,7 +603,7 @@ def load_and_replay_to_sql(pool: MysqlPool) -> None:
 # ===================== 配置加载 yaml优先 =====================
 def load_runtime_config() -> Dict[str, Any]:
     cfg: Dict[str, Any] = {}
-    yaml_path = "app.yaml"
+    yaml_path = yaml_file
     if os.path.exists(yaml_path):
         try:
             with open(yaml_path, "r", encoding="utf-8") as f:
@@ -644,11 +646,11 @@ def config_validate(cfg: dict) -> None:
 
 
 def save_config_to_yaml(cfg: dict) -> bool:
-    tmp_name = "app.yaml.tmp"
+    tmp_name = os.path.join(BASE_DIR, "app.yaml.tmp")
     try:
         with open(tmp_name, "w", encoding="utf-8") as f:
             yaml.dump(cfg, f, allow_unicode=True, sort_keys=False)
-        os.replace(tmp_name, "app.yaml")
+        os.replace(tmp_name,yaml_file)
         logger.info("配置写入app.yaml成功")
         return True
     except Exception:
