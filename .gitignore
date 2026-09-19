@@ -3,7 +3,7 @@ app.yaml
 
 # 日志文件
 *.log
-*.txt
+
 
 # 离线缓存json
 offline_cache.json

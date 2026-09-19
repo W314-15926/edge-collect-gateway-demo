@@ -17,7 +17,7 @@ from pymysql import OperationalError
 from pymodbus.client import ModbusTcpClient
 from pymodbus.exceptions import ModbusException
 from typing import Dict, List, Optional, Any, Tuple
-from fastapi import FastAPI, Query, Request, HTTPException
+from fastapi import FastAPI, Query, Request, HTTPException,Path
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 from queue import Queue, Empty, Full
@@ -905,6 +905,9 @@ def run_app_cfg() -> None:
     UVICORN_RUNNING = False
 
 # ===================== FastAPI接口 =====================
+from fastapi import FastAPI, Query, Request, HTTPException,Path, Body
+from pydantic import BaseModel, Field
+
 @app.middleware("http")
 async def slow_request_middleware(request: Request, call_next):
     t0 = time.time()
@@ -916,13 +919,16 @@ async def slow_request_middleware(request: Request, call_next):
     return resp
 
 
+# 健康探针
 @app.get("/health/live")
 async def health_live():
-    return {"code": 0, "msg": "live"}
+    """存活探针，只代表进程活着"""
+    return {"code": 0, "msg": "live", "data": None}
 
 
 @app.get("/health/ready")
 async def health_ready():
+    """就绪探针：数据库、队列背压校验"""
     assert DATA_QUEUE is not None
     q_size = DATA_QUEUE.qsize()
     with _lock_runtime_cfg:
@@ -931,85 +937,121 @@ async def health_ready():
         conn = pymysql.connect(**mysql_cfg)
         conn.close()
     except Exception:
-        return {"code": -1, "msg": "db not ready", "data": None}
+        raise HTTPException(status_code=503, detail="db not ready")
     if q_size > 800:
-        return {"code": -2, "msg": "queue backpressure", "data": {"queue_size": q_size}}
+        raise HTTPException(status_code=503, detail=f"queue backpressure, queue_size:{q_size}")
     return {"code": 0, "msg": "ready", "data": {"queue_size": q_size}}
 
 
-@app.post("/api/config/save_yaml")
-async def api_save_yaml():
-    ok = save_config_to_yaml(RUNTIME_CONFIG)
-    if ok:
-        return {"code": 0, "msg": "save yaml ok"}
-    return {"code": -1, "msg": "save yaml fail"}
-
-
-@app.get("/api/config/sta")
+# -------------------------- 配置资源 api/config --------------------------
+@app.get("/api/config")
 def api_config_sta():
+    """GET：读取当前运行配置资源"""
     try:
         with _lock_runtime_cfg:
             d = RUNTIME_CONFIG.copy()
         return {"code": 0, "msg": "ok", "data": d}
     except Exception:
-        return {"code": -1, "msg": "exception", "data": None}
+        raise HTTPException(status_code=500, detail="exception")
 
 
-@app.post("/api/alarm/blacklist/add")
-def api_blacklist_add(req: BlacklistAddModel):
+@app.put("/api/config", status_code=200)
+async def api_config_full_update(new_cfg: dict = Body(..., description="全量传入完整配置，更新内存中的config资源")):
+    """
+    PUT /api/config 全量更新配置资源（标准REST语义：替换整个资源）
+    仅更新内存运行时；如需持久化写入yaml，调用 POST /api/config/save
+    """
+    global RUNTIME_CONFIG
+    try:
+        # 简单校验key，实际项目可做更严格schema校验
+        if not isinstance(new_cfg, dict):
+            raise HTTPException(status_code=400, detail="config must be dict")
+        with _lock_runtime_cfg:
+            RUNTIME_CONFIG = new_cfg
+        return {"code": 0, "msg": "config resource updated(memory only)", "data": None}
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=500, detail="update config failed")
+
+
+@app.post("/api/config/save", status_code=200)
+async def api_config_save():
+    ok = save_config_to_yaml(RUNTIME_CONFIG)
+    if ok:
+        return {"code": 0, "msg": "save yaml ok", "data": None}
+    raise HTTPException(status_code=500, detail="save yaml fail")
+
+
+# -------------------------- 告警黑名单资源 /api/alarms/blacklist --------------------------
+@app.post("/api/alarms/blacklist", status_code=201)
+async def api_blacklist_add(req: BlacklistAddModel):
+    """新增一条告警黑名单条目，201 Created"""
     try:
         sid = req.slave_id
         at = req.alarm_type
+        if sid is None or not at:
+            raise HTTPException(status_code=400, detail="slave_id and alarm_type required")
         with _lock_alarm:
             if sid not in state_mgr.alarm_blacklist:
                 state_mgr.alarm_blacklist[sid] = []
             if at and at not in state_mgr.alarm_blacklist[sid]:
                 state_mgr.alarm_blacklist[sid].append(at)
-            return {"code": 0, "msg": "ok", "data": state_mgr.alarm_blacklist.copy()}
+        return {"code": 0, "msg": "created", "data": state_mgr.alarm_blacklist.copy()}
+    except HTTPException:
+        raise
     except Exception:
-        return {"code": -1, "msg": "err", "data": None}
+        raise HTTPException(status_code=500, detail="server error")
 
 
-@app.post("/api/alarm/blacklist/remove")
-def api_blacklist_remove(req: BlacklistRemoveModel):
+@app.delete("/api/alarms/blacklist/{slave_id}/types/{alarm_type}", status_code=200)
+async def api_blacklist_remove_item(slave_id: int = Path(..., ge=1), alarm_type: str = Path(...)):
+    """
+    删除从站下某一类告警黑名单（子资源路径，不再使用Query传参条件）
+    DELETE /api/alarms/blacklist/{slave_id}/types/{alarm_type}
+    """
     try:
-        sid = req.slave_id
-        at = req.alarm_type
         with _lock_alarm:
-            if sid in state_mgr.alarm_blacklist and at in state_mgr.alarm_blacklist[sid]:
-                state_mgr.alarm_blacklist[sid].remove(at)
-            return {"code": 0, "msg": "ok", "data": state_mgr.alarm_blacklist.copy()}
+            if slave_id in state_mgr.alarm_blacklist and alarm_type in state_mgr.alarm_blacklist[slave_id]:
+                state_mgr.alarm_blacklist[slave_id].remove(alarm_type)
+        return {"code": 0, "msg": "ok", "data": state_mgr.alarm_blacklist.copy()}
     except Exception:
-        return {"code": -1, "msg": "err", "data": None}
+        raise HTTPException(status_code=500, detail="server error")
 
 
-@app.get("/api/alarm/blacklist/sta")
+@app.get("/api/alarms/blacklist", status_code=200)
 def api_blacklist_sta():
+    """查询全部告警黑名单"""
     with _lock_alarm:
         return {"code": 0, "msg": "ok", "data": state_mgr.alarm_blacklist.copy()}
 
 
-@app.post("/api/blacklist/manual_add")
-def api_blacklist_manual_add(slave_id: int = Query(..., ge=1), ttl: int = Query(300, ge=10)):
+# -------------------------- 设备熔断黑名单 /api/devices --------------------------
+@app.post("/api/devices/{slave_id}/blacklist", status_code=201)
+def add_device_blacklist(slave_id: int = Path(..., description="Modbus从站ID")):
+    """将设备加入熔断黑名单，201 Created"""
+    ttl = 300
     if redis_wrap is not None:
         redis_wrap.add_blacklist(slave_id, ttl)
-    return {"code": 0, "msg": f"slave {slave_id} 加入黑名单，ttl={ttl}s"}
+    return {"code": 0, "msg": f"slave {slave_id} 加入黑名单，ttl={ttl}s", "data":{"ttl":ttl}}
 
 
-@app.post("/api/blacklist/manual_remove")
-def api_blacklist_manual_remove(slave_id: int = Query(..., ge=1)):
+@app.delete("/api/devices/{slave_id}/blacklist", status_code=200)
+def api_device_blacklist_remove(slave_id: int = Path(..., ge=1, description="Modbus从站ID")):
+    """移除设备熔断黑名单"""
     if redis_wrap is not None:
         redis_wrap.remove_blacklist(slave_id)
-    return {"code": 0, "msg": f"slave {slave_id} 移出黑名单"}
+    return {"code": 0, "msg": f"slave {slave_id} 移出黑名单", "data":None}
 
 
-@app.get("/api/stat")
-def api_stat(slave_id: int = Query(..., ge=1), limit: int = Query(50, ge=10, le=100)):
+@app.get("/api/devices/{slave_id}/statistics", status_code=200)
+def get_device_stat(slave_id: int = Path(..., description="Modbus从站ID")):
+    """获取单个设备统计信息；移除路径动词calc，statistics为名词资源"""
     try:
         with _lock_runtime_cfg:
             slave_dict = RUNTIME_CONFIG["slave_dict"]
         if slave_id not in slave_dict:
-            return {"code": -1, "msg": "slave not exist", "data": []}
+            raise HTTPException(status_code=404, detail="slave not exist")
         with _lock_window:
             win_copy = state_mgr.stat_data_window.copy()
         with _lock_slave_status:
@@ -1019,7 +1061,7 @@ def api_stat(slave_id: int = Query(..., ge=1), limit: int = Query(50, ge=10, le=
         if slave_id in win_copy and len(win_copy[slave_id]) > 0:
             last_item = win_copy[slave_id][-1]
             last_temp = last_item[0] if len(last_item) >= 1 else None
-            last_press = last_item[1] if len(last_item) >= 1 else None
+            last_press = last_item[1] if len(last_item) >= 2 else None
         ret = {
             "slave_id": slave_id,
             "temp": last_temp,
@@ -1029,8 +1071,43 @@ def api_stat(slave_id: int = Query(..., ge=1), limit: int = Query(50, ge=10, le=
             "offline": rec.get("offline", 0)
         }
         return {"code": 0, "msg": "ok", "data": ret}
+    except HTTPException:
+        raise
     except Exception:
-        return {"code": -1, "msg": "err", "data": None}
+        raise HTTPException(status_code=500, detail="server error")
+
+
+@app.get("/api/devices/statistics", status_code=200)
+def get_all_devices_stat():
+    """获取全部设备统计"""
+    out = []
+    try:
+        with _lock_runtime_cfg:
+            slave_dict = RUNTIME_CONFIG["slave_dict"]
+        with _lock_window:
+            win_copy = state_mgr.stat_data_window.copy()
+        with _lock_slave_status:
+            st_copy = state_mgr.slave_status_cache.copy()
+        for sid in slave_dict.keys():
+            rec = st_copy.get(sid, {})
+            last_temp, last_press = None, None
+            if sid in win_copy and len(win_copy[sid]) > 0:
+                last_item = win_copy[sid][-1]
+                last_temp = last_item[0] if len(last_item) >=1 else None
+                last_press = last_item[1] if len(last_item) >=2 else None
+            item = {
+                "slave_id": sid,
+                "temp": last_temp,
+                "press": last_press,
+                "success_cnt": rec.get("success_cnt",0),
+                "fail_cnt": rec.get("fail_cnt",0),
+                "offline": rec.get("offline",0)
+            }
+            out.append(item)
+        return {"code":0, "msg":"ok", "data": out}
+    except Exception:
+        raise HTTPException(status_code=500, detail="server error")
+
 
 # ===================== main入口 =====================
 def main() -> None:

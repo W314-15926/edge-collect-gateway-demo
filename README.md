@@ -54,6 +54,30 @@ edge-collect-gateway-demo
 故障注入测试：手动关停 MySQL、Redis 服务，验证降级逻辑、离线缓存、内存兜底是否生效。
 异常场景验证：程序 Ctrl+C 中断，验证 JSON 半写容错、优雅停机逻辑。
 
+## RESTful API 接口说明
+基于 FastAPI 实现一套 RESTful 风格运维监控接口，用于网关运行状态查询、黑名单运维、健康探测，**不对外提供原始PLC数据写操作，仅支持查询与运维管理**。
+
+> 交互式接口文档地址：`http://127.0.0.1:8000/docs`，由 FastAPI 自动生成 Swagger 文档
+
+## 接口分类
+1. **健康检查接口**
+- `GET /api/health`：服务存活探测，返回网关运行状态、线程存活数量
+2. **运行统计接口**
+- `GET /api/stats`：返回采集运行指标：总读取次数、失败次数、队列积压数量、离线缓存文件数量
+3. **设备黑名单运维接口（熔断）**
+- `GET /api/blacklist`：获取当前熔断黑名单设备列表
+- `POST /api/blacklist/add`：手动添加设备至熔断黑名单
+- `DELETE /api/blacklist/remove/{slave_ip}`：移除指定设备黑名单
+4. **配置与告警查询接口**
+- `GET /api/alarm/list`：查询本地存储的近期告警记录
+- `GET /api/config/view`：查看当前生效配置，敏感信息脱敏，不返回数据库、Redis密码
+
+## API附加特性
+- 内置慢请求中间件，请求耗时超过阈值自动打印告警日志；
+- 统一JSON返回结构，异常响应携带`code`错误码、`msg`描述信息；
+- 本Demo未实现身份鉴权，**如果用于生产环境，需要补充Token鉴权中间件**。
+
+
 ## 快速启动
 复制配置模板 `cp app.yaml.example app.yaml`，修改 Modbus、MySQL、Redis 连接配置
 安装依赖
