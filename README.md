@@ -84,7 +84,17 @@ edge-collect-gateway-demo
 ```bash 
 pip install -r requirements.txt
 ```
-执行 MySQL 建表 SQL（已提供 `schema.sql`）：
+执行 MySQL 建库，建表 SQL（已提供 `schema.sql`）：
+
+### 建库（第一次部署才需要）
+
+```sql
+CREATE DATABASE IF NOT EXISTS modbus_db
+    DEFAULT CHARACTER SET utf8mb4
+    DEFAULT COLLATE utf8mb4_unicode_ci;
+```
+### 建表（第一次部署才需要）
+
 ```bash
 mysql -u root -p modbus_db < schema.sql
 ```
