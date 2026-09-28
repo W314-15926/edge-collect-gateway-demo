@@ -26,8 +26,8 @@ redis:
 
 # 从站设备配置 key: slave_id，value: 采集间隔(单位：秒)
 slave_dict:
-  1: 1
-  2: 1
+  1: 2
+  2: 2
 
 # ========= V2 保留原有基础配置 =========
 txt_normal_path: "normal_record.txt"
@@ -49,6 +49,12 @@ max_thread_retry: 3
 shutdown_max_wait: 10
 batch_data_max: 200
 mem_warn_threshold_mb: 300
+
+# ========= V5 新增：脏寄存器量程配置 =========
+# 寄存器原始值不在 [reg_valid_min, reg_valid_max] 区间内，视为脏数据
+# 注意：不要把这里写成传感器物理量程，这里判断的是寄存器原始整数值
+reg_valid_min: 0
+reg_valid_max: 65535
 
 # ========= V4 新增配置项【预留，尚未实现】 =========
 # max_workers: 8

@@ -17,7 +17,7 @@ from pymysql import OperationalError
 from pymodbus.client import ModbusTcpClient
 from pymodbus.exceptions import ModbusException
 from typing import Dict, List, Optional, Any, Tuple
-from fastapi import FastAPI, Query, Request, HTTPException,Path
+from fastapi import FastAPI, Query, Request, HTTPException, Path, Body
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 from queue import Queue, Empty, Full
@@ -27,24 +27,11 @@ import uuid
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 yaml_file = os.path.join(BASE_DIR, "app.yaml")
 
+
 # ===================== 批次7：全局状态管理类 StateManager =====================
 class StateManager:
     """
     统一管理程序全部业务运行状态、统计计数、内存缓存
-    【可口述成员说明】
-    collect_total: modbus采集总次数
-    collect_success: 采集成功次数
-    collect_fail: 采集失败次数
-    db_write_total: mysql入库总次数
-    db_write_fail: mysql入库失败次数
-    queue_drop_cnt: 队列满丢弃数据计数
-    alarm_trigger_cnt: 告警触发总次数
-    alarm_time_map: 告警防抖时间戳字典 key:"{slave_id}_alarmtype" value:时间戳
-    slave_status_cache: 从站状态缓存 {slave_id:{"success_cnt","fail_cnt","offline"}}
-    stat_data_window: 从站采样滑动窗口，用于稳定性判定
-    alarm_blacklist: 告警类型黑名单 {slave_id:[alarm_type]}
-    local_blacklist: redis不可用时降级的本地熔断黑名单 key:slave_id value:过期时间戳
-    SHUTDOWN_FLAG: 停机标记，通知所有业务线程退出循环
     """
     def __init__(self):
         # 采集统计计数器
@@ -77,7 +64,7 @@ UVICORN_RUNNING = False
 RUNTIME_CONFIG: Dict[str, Any] = {}
 app = FastAPI(title="modbus采集查询服务 V4")
 
-# ========== 批次6：细粒度锁（沿用，不改动） ==========
+# ========== 批次6：细粒度锁 ==========
 _lock_stats = threading.Lock()          # 采集统计计数器
 _lock_slave_status = threading.Lock()   # slave_status_cache 从站状态
 _lock_window = threading.Lock()         # stat_data_window 滑动窗口
@@ -85,10 +72,10 @@ _lock_alarm = threading.Lock()          # alarm_time_map / alarm_blacklist 告�
 _lock_local_black = threading.Lock()    # local_blacklist redis降级内存黑名单
 _lock_runtime_cfg = threading.Lock()    # RUNTIME_CONFIG配置读取
 _lock_file_io = threading.Lock()        # txt文件写入（IO必须串行）
-_lock_json_cache = threading.Lock()      # 离线json缓存读写
+_lock_json_cache = threading.Lock()     # 离线json缓存读写
 
 
-# ===================== Redis封装类 V4核心新增 =====================
+# ===================== Redis封装类 V4核心 =====================
 class RedisClientWrap:
     def __init__(self, redis_cfg: dict):
         self.cfg = redis_cfg
@@ -206,6 +193,7 @@ class RedisClientWrap:
 
 redis_wrap: Optional[RedisClientWrap] = None
 
+
 # ===================== Pydantic 请求模型 =====================
 class ConfigReloadModel(BaseModel):
     slave_id: Optional[int] = Field(None, ge=1, description="从站id")
@@ -222,7 +210,8 @@ class BlacklistRemoveModel(BaseModel):
     slave_id: Optional[int] = Field(None, ge=1, description="从站id")
     alarm_type: Optional[str] = Field(None, description="告警类型")
 
-# ===================== 日志初始化（批次8：轮转参数合理化） =====================
+
+# ===================== 日志初始化 =====================
 def init_logger(log_name: str, log_file: str) -> logging.Logger:
     logger = logging.getLogger(log_name)
     logger.setLevel(logging.INFO)
@@ -239,6 +228,7 @@ def init_logger(log_name: str, log_file: str) -> logging.Logger:
 
 logger = init_logger("collect", "collect.log")
 
+
 # ===================== 信号处理 =====================
 def handle_receive_signal(signum: int, frame: Optional[Any]) -> None:
     global UVICORN_RUNNING, uvicorn_server
@@ -251,6 +241,7 @@ def handle_receive_signal(signum: int, frame: Optional[Any]) -> None:
 
 signal.signal(signal.SIGINT, handle_receive_signal)
 signal.signal(signal.SIGTERM, handle_receive_signal)
+
 
 # ===================== 文件工具函数 =====================
 def init_txt(file_path: str) -> None:
@@ -316,6 +307,7 @@ def write_to_stat_txt(collect_time: str, slave_id: int, temp_list: List[float], 
         except Exception:
             logger.error(f"写入stat txt失败\n{traceback.format_exc()}")
 
+
 # ===================== 从站上下线监控 =====================
 def slave_online_monitor(slave_id: int, success: bool) -> int:
     with _lock_slave_status:
@@ -345,6 +337,7 @@ def slave_online_monitor(slave_id: int, success: bool) -> int:
     with _lock_slave_status:
         return info["offline"]
 
+
 # ===================== 滑动窗口稳定性判断 =====================
 def stat_stable(window_data: List[List[Optional[float]]]) -> int:
     with _lock_runtime_cfg:
@@ -361,15 +354,24 @@ def stat_stable(window_data: List[List[Optional[float]]]) -> int:
     press_ok = all(abs(press_group[i] - press_group[j]) <= stable_threshold for i in range(stable_window_cnt) for j in range(i + 1, stable_window_cnt))
     return 1 if (temp_ok or press_ok) else 0
 
-# ===================== 脏寄存器过滤 批次5 Bug3修复保留不动 =====================
+
+# ===================== 脏寄存器过滤（V5：量程配置化） =====================
 def filter_dirty_regs(reg_list: List[int]) -> bool:
+    """
+    返回 True 表示含脏数据（应跳过本次入库），False 表示全部有效。
+    有效区间从 yaml 的 reg_valid_min / reg_valid_max 读取，避免硬编码。
+    """
     if len(reg_list) == 0:
         return True
+    with _lock_runtime_cfg:
+        valid_min = RUNTIME_CONFIG.get("reg_valid_min", 0)
+        valid_max = RUNTIME_CONFIG.get("reg_valid_max", 65535)
     for r in reg_list:
-        if r == 0 or r == 65535:
-            logger.debug(f"检测脏寄存器值 {r}")
+        if r < valid_min or r > valid_max:
+            logger.debug(f"检测脏寄存器值 {r}，有效区间[{valid_min}, {valid_max}]")
             return True
     return False
+
 
 # ===================== struct解析寄存器转float =====================
 def parse_regs_to_floats(reg_list: List[int]) -> List[float]:
@@ -388,6 +390,7 @@ def parse_regs_to_floats(reg_list: List[int]) -> List[float]:
     except Exception:
         logger.error(f"寄存器解析失败\n{traceback.format_exc()}")
     return floats
+
 
 # ===================== 告警防抖逻辑 =====================
 def alarm_rule(slave_id: int, float_list: List[float]) -> Tuple[str, str]:
@@ -426,6 +429,7 @@ def alarm_rule(slave_id: int, float_list: List[float]) -> Tuple[str, str]:
             state_mgr.alarm_trigger_cnt += 1
     return alarm_str, alarm_level
 
+
 # ===================== Modbus重连 =====================
 def modbus_reconnect(client: ModbusTcpClient) -> bool:
     client.close()
@@ -462,7 +466,8 @@ def read_modbus_regs(client: ModbusTcpClient, slave_id: int, modbus_addr: int, m
         logger.error(f"读寄存器异常\n{traceback.format_exc()}")
     return collect_time, reg_list, float_list, status
 
-# ===================== Mysql连接池 Bug2修复保留不动 =====================
+
+# ===================== Mysql连接池 =====================
 class MysqlPool:
     def __init__(self, cfg: Dict[str, Any], max_idle: int):
         self.cfg = cfg
@@ -475,20 +480,24 @@ class MysqlPool:
             except Exception:
                 logger.error("初始化连接池创建连接失败")
 
-    def get_conn(self) -> Optional[pymysql.connections.Connection]:
+    def get_conn(self):
         try:
             conn: Optional[pymysql.connections.Connection]
             if not self.queue.empty():
                 conn = self.queue.get()
             else:
                 conn = pymysql.connect(**self.cfg)
-            conn.ping(reconnect=True)
+            # 不用 reconnect 参数，自己 try
+            try:
+                conn.ping(reconnect=False)
+            except Exception:
+                conn = pymysql.connect(**self.cfg)
             return conn
         except Exception:
             logger.error(f"获取连接失败\n{traceback.format_exc()}")
             return None
 
-    def release_conn(self, conn: Optional[pymysql.connections.Connection]) -> None:
+    def release_conn(self, conn):
         if conn is None:
             return
         try:
@@ -503,11 +512,6 @@ class MysqlPool:
                 conn.close()
             except Exception:
                 pass
-        except Exception:
-            try:
-                conn.close()
-            except Exception:
-                pass
 
     def close_all(self) -> None:
         while not self.queue.empty():
@@ -516,6 +520,7 @@ class MysqlPool:
                 c.close()
             except Exception:
                 pass
+
 
 # ===================== SQL写入 =====================
 def write_to_sql(pool: MysqlPool, batch_list: List[tuple]) -> bool:
@@ -549,7 +554,8 @@ def write_to_sql(pool: MysqlPool, batch_list: List[tuple]) -> bool:
             cur.close()
         pool.release_conn(conn)
 
-# ===================== JSON离线缓存 Bug4修复保留不动 =====================
+
+# ===================== JSON离线缓存 =====================
 def save_to_json(batch_list: list) -> None:
     if not batch_list:
         return
@@ -558,7 +564,7 @@ def save_to_json(batch_list: list) -> None:
         tmp_file = cache_file + ".tmp"
     cache_list = []
     try:
-        if os.path.exists(cache_file):
+        if os.path.exists(cache_file) and os.path.getsize(cache_file) > 0:
             with _lock_json_cache:
                 with open(cache_file, "r", encoding="utf-8") as f:
                     cache_list = json.load(f)
@@ -581,6 +587,9 @@ def load_and_replay_to_sql(pool: MysqlPool) -> None:
         cache_file = RUNTIME_CONFIG["cache_file"]
     if not os.path.exists(cache_file):
         return
+    if os.path.getsize(cache_file) == 0:
+        logger.info("离线缓存文件为空，跳过回放")
+        return
     try:
         with _lock_json_cache:
             with open(cache_file, "r", encoding="utf-8") as f:
@@ -600,6 +609,7 @@ def load_and_replay_to_sql(pool: MysqlPool) -> None:
             except OSError:
                 logger.warning("缓存文件删除失败，可能被其他进程占用")
 
+
 # ===================== 配置加载 yaml优先 =====================
 def load_runtime_config() -> Dict[str, Any]:
     cfg: Dict[str, Any] = {}
@@ -612,8 +622,9 @@ def load_runtime_config() -> Dict[str, Any]:
                     cfg.update(yml_data)
             logger.info("已加载 app.yaml")
             return cfg
-        except Exception:
-            logger.warning("app.yaml读取失败")
+        except Exception as e:
+            logger.warning(f"app.yaml读取失败: {e}")
+            logger.warning(traceback.format_exc())
     logger.fatal("缺少app.yaml配置文件！")
     sys.exit(1)
 
@@ -625,7 +636,9 @@ def config_validate(cfg: dict) -> None:
         "data_queue_maxsize", "consumer_thread_num", "max_thread_retry",
         "shutdown_max_wait", "stable_threshold", "alarm_interval",
         "stat_interval", "heartbeat_interval", "batch_data_max",
-        "mem_warn_threshold_mb", "mysql", "modbus", "slave_dict", "redis"
+        "mem_warn_threshold_mb", "reg_valid_min", "reg_valid_max",
+        "rate_limit_cnt", "rate_limit_window",
+        "mysql", "modbus", "slave_dict", "redis"
     ]
     missing = []
     for k in required_keys:
@@ -650,7 +663,7 @@ def save_config_to_yaml(cfg: dict) -> bool:
     try:
         with open(tmp_name, "w", encoding="utf-8") as f:
             yaml.dump(cfg, f, allow_unicode=True, sort_keys=False)
-        os.replace(tmp_name,yaml_file)
+        os.replace(tmp_name, yaml_file)
         logger.info("配置写入app.yaml成功")
         return True
     except Exception:
@@ -658,6 +671,7 @@ def save_config_to_yaml(cfg: dict) -> bool:
         if os.path.exists(tmp_name):
             os.remove(tmp_name)
         return False
+
 
 # ===================== 程序启动自检 =====================
 def startup_self_check(mysql_cfg: dict, modbus_cfg: dict) -> None:
@@ -692,7 +706,8 @@ def startup_self_check(mysql_cfg: dict, modbus_cfg: dict) -> None:
         init_txt(fp)
     logger.info("===== 全部自检通过，启动业务线程 =====")
 
-# ===================== 内存监控线程（批次6分段sleep） =====================
+
+# ===================== 内存监控线程 =====================
 def mem_monitor_thread() -> None:
     proc = psutil.Process(os.getpid())
     while not state_mgr.SHUTDOWN_FLAG:
@@ -713,6 +728,7 @@ def mem_monitor_thread() -> None:
             time.sleep(2)
     logger.info("内存监控线程退出")
 
+
 # ===================== 采集线程内层循环 =====================
 def _inner_collect_loop(slave_id: int, interval: int, modbus_cfg: Dict[str, Any]) -> None:
     client = ModbusTcpClient(host=modbus_cfg["host"], port=modbus_cfg["port"], timeout=modbus_cfg["timeout"])
@@ -726,10 +742,15 @@ def _inner_collect_loop(slave_id: int, interval: int, modbus_cfg: Dict[str, Any]
             logger.debug(f"从站{slave_id}在熔断黑名单，跳过采集")
             time.sleep(1)
             continue
-        if redis_wrap is not None and redis_wrap.zset_rate_limit(slave_id, limit_cnt=5, window_seconds=10):
+        # 限流：从 yaml 读阈值
+        with _lock_runtime_cfg:
+            rl_limit = RUNTIME_CONFIG["rate_limit_cnt"]
+            rl_window = RUNTIME_CONFIG["rate_limit_window"]
+        if redis_wrap is not None and redis_wrap.zset_rate_limit(slave_id, limit_cnt=rl_limit, window_seconds=rl_window):
             logger.warning(f"从站{slave_id}触发采集限流")
             time.sleep(0.5)
             continue
+        # 采集防并发锁：获取锁
         lock_key = f"collect:lock:{slave_id}"
         lock_val: Optional[str] = None
         if redis_wrap is not None:
@@ -738,7 +759,6 @@ def _inner_collect_loop(slave_id: int, interval: int, modbus_cfg: Dict[str, Any]
             logger.debug(f"从站{slave_id}获取采集锁失败，跳过本次采集")
             time.sleep(0.2)
             continue
-
         ct, regs, floats, status = read_modbus_regs(client, slave_id, modbus_cfg["addr"], modbus_cfg["count"])
         success_flag = False
         with _lock_stats:
@@ -803,9 +823,11 @@ def slave_collect_thread_wrapped(slave_id: int, interval: int, modbus_cfg: Dict[
                 break
             time.sleep(2)
 
-# ===================== 消费线程 =====================
+
+# ===================== 消费线程（数量 + 时间双阈值刷盘） =====================
 def _inner_consumer_loop(pool: MysqlPool) -> None:
     batch_buffer: List[tuple] = []
+    last_flush_ts = time.time()
     while not state_mgr.SHUTDOWN_FLAG or not DATA_QUEUE.empty():
         try:
             assert DATA_QUEUE is not None
@@ -822,13 +844,22 @@ def _inner_consumer_loop(pool: MysqlPool) -> None:
             batch_buffer.append(row_tuple)
             with _lock_runtime_cfg:
                 batch_max = RUNTIME_CONFIG["batch_data_max"]
-            if len(batch_buffer) >= batch_max:
+            now_ts = time.time()
+            if len(batch_buffer) >= batch_max or (batch_buffer and now_ts - last_flush_ts >= 5.0):
                 batch_copy = batch_buffer.copy()
                 batch_buffer.clear()
+                last_flush_ts = now_ts
                 ok = write_to_sql(pool, batch_copy)
                 if not ok:
                     save_to_json(batch_copy)
         except Empty:
+            if batch_buffer and time.time() - last_flush_ts >= 5.0:
+                batch_copy = batch_buffer.copy()
+                batch_buffer.clear()
+                last_flush_ts = time.time()
+                ok = write_to_sql(pool, batch_copy)
+                if not ok:
+                    save_to_json(batch_copy)
             continue
         except OSError:
             logger.warning("消费线程OS异常")
@@ -855,7 +886,8 @@ def consumer_thread_wrapped(pool: MysqlPool) -> None:
                 break
             time.sleep(2)
 
-# ===================== 统计线程（批次6分段sleep） =====================
+
+# ===================== 统计线程 =====================
 def stat_thread() -> None:
     logger.info("stat线程启动")
     while not state_mgr.SHUTDOWN_FLAG:
@@ -884,7 +916,14 @@ def health_thread() -> None:
     while not state_mgr.SHUTDOWN_FLAG:
         with _lock_runtime_cfg:
             hb_int = RUNTIME_CONFIG["heartbeat_interval"]
-        time.sleep(hb_int)
+        # 分段sleep，可快速响应停机信号
+        sleep_total = hb_int
+        step = 0.2
+        while sleep_total > 0 and not state_mgr.SHUTDOWN_FLAG:
+            t_slp = min(step, sleep_total)
+            time.sleep(t_slp)
+            sleep_total -= t_slp
+
         assert DATA_QUEUE is not None
         q_size = DATA_QUEUE.qsize()
         with _lock_slave_status:
@@ -895,6 +934,7 @@ def health_thread() -> None:
             logger.info(f"  slave{sid} {st} succ:{info['success_cnt']} fail:{info['fail_cnt']}")
     logger.info("health线程退出")
 
+
 # ===================== FastAPI服务启动 =====================
 def run_app_cfg() -> None:
     global uvicorn_server, UVICORN_RUNNING
@@ -904,10 +944,8 @@ def run_app_cfg() -> None:
     uvicorn_server.run()
     UVICORN_RUNNING = False
 
-# ===================== FastAPI接口 =====================
-from fastapi import FastAPI, Query, Request, HTTPException,Path, Body
-from pydantic import BaseModel, Field
 
+# ===================== FastAPI接口 =====================
 @app.middleware("http")
 async def slow_request_middleware(request: Request, call_next):
     t0 = time.time()
@@ -919,7 +957,6 @@ async def slow_request_middleware(request: Request, call_next):
     return resp
 
 
-# 健康探针
 @app.get("/health/live")
 async def health_live():
     """存活探针，只代表进程活着"""
@@ -943,7 +980,6 @@ async def health_ready():
     return {"code": 0, "msg": "ready", "data": {"queue_size": q_size}}
 
 
-# -------------------------- 配置资源 api/config --------------------------
 @app.get("/api/config")
 def api_config_sta():
     """GET：读取当前运行配置资源"""
@@ -957,13 +993,8 @@ def api_config_sta():
 
 @app.put("/api/config", status_code=200)
 async def api_config_full_update(new_cfg: dict = Body(..., description="全量传入完整配置，更新内存中的config资源")):
-    """
-    PUT /api/config 全量更新配置资源（标准REST语义：替换整个资源）
-    仅更新内存运行时；如需持久化写入yaml，调用 POST /api/config/save
-    """
     global RUNTIME_CONFIG
     try:
-        # 简单校验key，实际项目可做更严格schema校验
         if not isinstance(new_cfg, dict):
             raise HTTPException(status_code=400, detail="config must be dict")
         with _lock_runtime_cfg:
@@ -983,7 +1014,6 @@ async def api_config_save():
     raise HTTPException(status_code=500, detail="save yaml fail")
 
 
-# -------------------------- 告警黑名单资源 /api/alarms/blacklist --------------------------
 @app.post("/api/alarms/blacklist", status_code=201)
 async def api_blacklist_add(req: BlacklistAddModel):
     """新增一条告警黑名单条目，201 Created"""
@@ -1006,10 +1036,6 @@ async def api_blacklist_add(req: BlacklistAddModel):
 
 @app.delete("/api/alarms/blacklist/{slave_id}/types/{alarm_type}", status_code=200)
 async def api_blacklist_remove_item(slave_id: int = Path(..., ge=1), alarm_type: str = Path(...)):
-    """
-    删除从站下某一类告警黑名单（子资源路径，不再使用Query传参条件）
-    DELETE /api/alarms/blacklist/{slave_id}/types/{alarm_type}
-    """
     try:
         with _lock_alarm:
             if slave_id in state_mgr.alarm_blacklist and alarm_type in state_mgr.alarm_blacklist[slave_id]:
@@ -1026,14 +1052,13 @@ def api_blacklist_sta():
         return {"code": 0, "msg": "ok", "data": state_mgr.alarm_blacklist.copy()}
 
 
-# -------------------------- 设备熔断黑名单 /api/devices --------------------------
 @app.post("/api/devices/{slave_id}/blacklist", status_code=201)
 def add_device_blacklist(slave_id: int = Path(..., description="Modbus从站ID")):
     """将设备加入熔断黑名单，201 Created"""
     ttl = 300
     if redis_wrap is not None:
         redis_wrap.add_blacklist(slave_id, ttl)
-    return {"code": 0, "msg": f"slave {slave_id} 加入黑名单，ttl={ttl}s", "data":{"ttl":ttl}}
+    return {"code": 0, "msg": f"slave {slave_id} 加入黑名单，ttl={ttl}s", "data": {"ttl": ttl}}
 
 
 @app.delete("/api/devices/{slave_id}/blacklist", status_code=200)
@@ -1041,12 +1066,12 @@ def api_device_blacklist_remove(slave_id: int = Path(..., ge=1, description="Mod
     """移除设备熔断黑名单"""
     if redis_wrap is not None:
         redis_wrap.remove_blacklist(slave_id)
-    return {"code": 0, "msg": f"slave {slave_id} 移出黑名单", "data":None}
+    return {"code": 0, "msg": f"slave {slave_id} 移出黑名单", "data": None}
 
 
 @app.get("/api/devices/{slave_id}/statistics", status_code=200)
 def get_device_stat(slave_id: int = Path(..., description="Modbus从站ID")):
-    """获取单个设备统计信息；移除路径动词calc，statistics为名词资源"""
+    """获取单个设备统计信息"""
     try:
         with _lock_runtime_cfg:
             slave_dict = RUNTIME_CONFIG["slave_dict"]
@@ -1093,18 +1118,18 @@ def get_all_devices_stat():
             last_temp, last_press = None, None
             if sid in win_copy and len(win_copy[sid]) > 0:
                 last_item = win_copy[sid][-1]
-                last_temp = last_item[0] if len(last_item) >=1 else None
-                last_press = last_item[1] if len(last_item) >=2 else None
+                last_temp = last_item[0] if len(last_item) >= 1 else None
+                last_press = last_item[1] if len(last_item) >= 2 else None
             item = {
                 "slave_id": sid,
                 "temp": last_temp,
                 "press": last_press,
-                "success_cnt": rec.get("success_cnt",0),
-                "fail_cnt": rec.get("fail_cnt",0),
-                "offline": rec.get("offline",0)
+                "success_cnt": rec.get("success_cnt", 0),
+                "fail_cnt": rec.get("fail_cnt", 0),
+                "offline": rec.get("offline", 0)
             }
             out.append(item)
-        return {"code":0, "msg":"ok", "data": out}
+        return {"code": 0, "msg": "ok", "data": out}
     except Exception:
         raise HTTPException(status_code=500, detail="server error")
 
