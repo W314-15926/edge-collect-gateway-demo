@@ -19,7 +19,7 @@ CREATE TABLE IF NOT EXISTS modbus_day2_data (
     UNIQUE KEY uk_slave_time (slave_id, collect_time)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='Modbus采集业务数据表';
 
--- 历史备份表（离线缓存回放兜底，结构与主表一致，无业务字段）
+-- 历史备份表
 CREATE TABLE IF NOT EXISTS modbus_history_backup (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
     collect_time DATETIME NOT NULL,
