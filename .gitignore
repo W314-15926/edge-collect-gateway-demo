@@ -3,10 +3,20 @@ app.yaml
 
 # 日志文件
 *.log
-
+collectlog
 
 # 离线缓存json
 offline_cache.json
+offline_cache.json.tmp
+
+# 运行时数据文件
+alarm_record.txt
+normal_record.txt
+stat_record.txt
+
+# 历史版本
+history_iter/
+.history_iter/
 
 # python缓存
 __pycache__/
@@ -17,3 +27,6 @@ __pycache__/
 # 系统文件
 .DS_Store
 Thumbs.db
+
+# 个人资料，不提交
+秋招错题卡壳.md

@@ -84,7 +84,11 @@ edge-collect-gateway-demo
 ```bash 
 pip install -r requirements.txt
 ```
-执行 MySQL 建表 SQL，预先创建业务数据表 modbus_day2_data、modbus_history_backup
+执行 MySQL 建表 SQL（已提供 `schema.sql`）：
+```bash
+mysql -u root -p modbus_db < schema.sql
+```
+
 运行程序
 ```bash
 python src/main.py
