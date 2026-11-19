@@ -12,9 +12,9 @@
 > 用于学习工业边缘采集的并发、容错、边界异常处理，不是商用生产版本。
 
 ## 技术栈
-Python3.9+ | FastAPI | pymodbus | pymysql | redis | threading | Queue | pyyaml
+Python3.9+ | FastAPI | uvicorn | pymodbus | PyMySQL | redis | pyyaml | threading / Queue
 
-## ✨ 核心能力
+## 核心能力
 - Modbus‑TCP：每个从站独立采集线程，内置Modbus自动重连逻辑
 - 生产者‑消费者线程安全队列做缓冲，设置队列上限，队列满直接丢弃最新数据并打印告警日志，防止内存溢出
 - 自定义MySQL连接池，增加连接有效性检测，自动处理数据库闪断、僵死失效连接
@@ -28,7 +28,7 @@ Python3.9+ | FastAPI | pymodbus | pymysql | redis | threading | Queue | pyyaml
 ## 架构简述
 1. **采集层**：每台从站分配独立采集线程；采集前做黑名单、限流、本机防并发锁校验，读取寄存器后投递至线程安全队列。
 2. **队列缓冲层**：线程安全Queue作为缓冲，设置最大长度，防止消息堆积造成OOM。
-3. **消费持久层**：多消费线程从队列取出数据，批量组装写入MySQL；数据库故障时写入本地JSON离线缓存。
+3. **消费持久层**：消费线程（数量可配）从队列取出数据，批量组装写入MySQL；数据库故障时写入本地JSON离线缓存。
 4. **控制层**：Redis实现熔断、限流、本机防并发锁；Redis不可用切换内存兜底方案。
 5. **API层**：FastAPI提供运维、监控、数据查询HTTP接口。
 6. **后台辅助线程**：内存监控、设备健康巡检、指标统计线程，独立运行不阻塞主业务。
@@ -36,17 +36,18 @@ Python3.9+ | FastAPI | pymodbus | pymysql | redis | threading | Queue | pyyaml
 ## 项目目录简要
 ```tree
 edge-collect-gateway-demo
-├── v4.py                 # 程序主入口
-├── app.yaml.example      # 配置模板，复制为 app.yaml 使用
-├── bug_notes.md          # Bug记录：现象、排查、复现、修复验证
-├── requirements.txt      # 项目依赖
 ├── src
-│   ├── gateway           # 采集核心逻辑，StateManager状态管理、设备轮询
-│   ├── pool              # MySQL自定义连接池实现、连接健康检测
-│   ├── api               # FastAPI 运维接口、慢请求中间件
-│   └── utils             # 日志轮转、信号处理、离线缓存、锁工具
-├── logs                  # 轮转日志输出目录
-└── offline_cache         # MySQL故障时本地JSON离线缓存目录
+│   └── main.py           # 程序主入口（采集、连接池、接口、工具均在本文件内）
+├── app.yaml.example      # 配置模板，复制为 app.yaml 后修改（app.yaml 不入库）
+├── schema.sql            # 建表 SQL（业务主表 + 历史备份表）
+├── requirements.txt      # 项目依赖
+├── bug_notes.md          # 4 类缺陷：现象、根因、改动点、复现、验证
+├── history_iter/         # 历史迭代版本 v1–v3，仅留档不参与运行
+├── collect.log           # 运行日志（256MB × 5 轮转，运行时生成）
+├── offline_cache.json    # MySQL 不可用时的离线缓存（运行时生成）
+├── normal_record.txt     # 采集明细记录（运行时生成）
+├── alarm_record.txt      # 告警记录（运行时生成）
+└── stat_record.txt       # 统计记录（运行时生成）
 ```
 
 ## 测试说明
@@ -55,27 +56,29 @@ edge-collect-gateway-demo
 异常场景验证：程序 Ctrl+C 中断，验证 JSON 半写容错、优雅停机逻辑。
 
 ## RESTful API 接口说明
-基于 FastAPI 实现一套 RESTful 风格运维监控接口，用于网关运行状态查询、黑名单运维、健康探测，**不对外提供原始PLC数据写操作，仅支持查询与运维管理**。
+基于 FastAPI 实现一套运维监控接口，用于存活/就绪探测、设备统计查询、告警黑名单与熔断运维、配置读写，**不对外提供原始采集数据的写操作**。
 
-> 交互式接口文档地址：`http://127.0.0.1:8000/docs`，由 FastAPI 自动生成 Swagger 文档
+> 服务监听 `0.0.0.0:8001`（不是 8000）。交互式文档地址：`http://127.0.0.1:8001/docs`，由 FastAPI 自动生成。
 
-## 接口分类
-1. **健康检查接口**
-- `GET /api/health`：服务存活探测，返回网关运行状态、线程存活数量
-2. **运行统计接口**
-- `GET /api/stats`：返回采集运行指标：总读取次数、失败次数、队列积压数量、离线缓存文件数量
-3. **设备黑名单运维接口（熔断）**
-- `GET /api/blacklist`：获取当前熔断黑名单设备列表
-- `POST /api/blacklist/add`：手动添加设备至熔断黑名单
-- `DELETE /api/blacklist/remove/{slave_ip}`：移除指定设备黑名单
-4. **配置与告警查询接口**
-- `GET /api/alarm/list`：查询本地存储的近期告警记录
-- `GET /api/config/view`：查看当前生效配置，敏感信息脱敏，不返回数据库、Redis密码
+| 分类 | 方法与路径 | 说明 |
+|---|---|---|
+| 健康探测 | `GET /health/live` | 存活探针，只表示进程活着 |
+| 健康探测 | `GET /health/ready` | 就绪探针：连库校验 + 队列背压，积压超过 800 返回 503 |
+| 配置 | `GET /api/config` | 读取内存中的当前运行配置 |
+| 配置 | `PUT /api/config` | 全量替换内存配置，**不落盘**，重启即失效 |
+| 配置 | `POST /api/config/save` | 将内存配置写回 `app.yaml` |
+| 设备统计 | `GET /api/devices/statistics` | 全部从站的最新温度/压力、成功与失败次数、在线状态 |
+| 设备统计 | `GET /api/devices/{slave_id}/statistics` | 单个从站同上；从站不存在返回 404 |
+| 告警黑名单 | `POST /api/alarms/blacklist` | 新增一条（从站 + 告警类型），201 Created |
+| 告警黑名单 | `DELETE /api/alarms/blacklist/{slave_id}/types/{alarm_type}` | 删除指定条目 |
+| 告警黑名单 | `GET /api/alarms/blacklist` | 查询全部告警黑名单 |
+| 熔断黑名单 | `POST /api/devices/{slave_id}/blacklist` | 设备拉黑，TTL 300 秒 |
+| 熔断黑名单 | `DELETE /api/devices/{slave_id}/blacklist` | 设备解除拉黑 |
 
 ## API附加特性
 - 内置慢请求中间件，请求耗时超过阈值自动打印告警日志；
-- 统一JSON返回结构，异常响应携带`code`错误码、`msg`描述信息；
-- 本Demo未实现身份鉴权，**如果用于生产环境，需要补充Token鉴权中间件**。
+- 统一 JSON 返回结构 `{"code":0,"msg":"...","data":...}`，异常通过 `HTTPException` 返回 400 / 404 / 500 / 503；
+- **未实现身份鉴权，且 `GET /api/config` 直接返回完整运行配置（含数据库账号密码）。只能单机或内网使用，禁止暴露公网；上生产必须补 Token 鉴权与敏感字段脱敏。**
 
 
 ## 快速启动
@@ -99,15 +102,18 @@ CREATE DATABASE IF NOT EXISTS modbus_db
 mysql -u root -p modbus_db < schema.sql
 ```
 
-运行程序
+运行程序（必须在项目根目录执行，程序按 `src` 的上一级定位 `app.yaml`，日志也写在当前工作目录）
 ```bash
 python src/main.py
 ```
 
+启动时先做自检：MySQL 连接失败或缺表会直接退出（退出码 1）；Modbus 连接测试失败只告警不退出。自检通过后依次启动采集、消费、统计、健康巡检、内存监控与接口线程。停止用 `Ctrl+C` 或 `kill -TERM`，程序等待在途任务完成后退出，最长 10 秒，不要用 `kill -9`。
+
 ## 项目说明
 - 本项目为工业采集服务学习 Demo。
 - Redis 锁仅用于**本机多线程防重复采集**，并未实现跨机器真正分布式锁（缺少锁续期、主从切换等逻辑）。
-- 线上故障修复记录、复现与验证方案查看 bug_notes.md。
+- 模拟环境下的故障修复记录、复现与验证方案查看 `bug_notes.md`。
 - 批次 6：已完成全局大锁拆分为多把业务细粒度锁，降低锁竞争
 - 批次 7：已实现 StateManager 统一收拢绝大多数业务状态
 - 后续待优化：进一步缩小锁临界区；收拢剩余顶层运行时全局对象。
+

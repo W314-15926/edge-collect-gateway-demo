@@ -1,5 +1,5 @@
 # Bug修复记录（批次5 Git提交：fix: fix 4 critical production bugs）
-> 记录线上模拟出现的4类稳定性故障，包含现象、根因、代码改动点、复现步骤、修复验证方法；后续重构规划写在文档末尾。
+> 记录模拟环境（Modbus Slave 模拟器）中出现的4类稳定性故障，包含现象、根因、代码改动点、复现步骤、修复验证方法；后续重构规划写在文档末尾。
 
 ## Bug1：告警黑名单接口缺少全局变量alarm_blacklist，调用接口直接抛出 NameError，FastAPI 返回500崩溃
 - **现象**
@@ -11,7 +11,7 @@
 2. 新增细粒度锁 `_lock_alarm = threading.Lock()`，所有对`alarm_blacklist`读写操作都加锁保护；
 3. FastAPI接口全部改为读写`state_mgr.alarm_blacklist`对象，移除独立全局字典。
 - **复现步骤**
-1. 启动v4.py程序；
+1. 启动 `src/main.py`；
 2. POST请求调用接口 `POST /api/alarm/blacklist/add`，传入`slave_id=1,alarm_type="temp"`；
 3. 观察服务日志，直接抛出NameError异常，HTTP响应500。
 - **修复验证**
