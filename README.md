@@ -36,17 +36,18 @@ Python3.9+ | FastAPI | pymodbus | pymysql | redis | threading | Queue | pyyaml
 ## 项目目录简要
 ```tree
 edge-collect-gateway-demo
-├── v4.py                 # 程序主入口
-├── app.yaml.example      # 配置模板，复制为 app.yaml 使用
-├── bug_notes.md          # Bug记录：现象、排查、复现、修复验证
-├── requirements.txt      # 项目依赖
 ├── src
-│   ├── gateway           # 采集核心逻辑，StateManager状态管理、设备轮询
-│   ├── pool              # MySQL自定义连接池实现、连接健康检测
-│   ├── api               # FastAPI 运维接口、慢请求中间件
-│   └── utils             # 日志轮转、信号处理、离线缓存、锁工具
-├── logs                  # 轮转日志输出目录
-└── offline_cache         # MySQL故障时本地JSON离线缓存目录
+│   └── main.py           # 程序主入口（采集、连接池、接口、工具均在本文件内）
+├── app.yaml.example      # 配置模板，复制为 app.yaml 后修改（app.yaml 不入库）
+├── schema.sql            # 建表 SQL（业务主表 + 历史备份表）
+├── requirements.txt      # 项目依赖
+├── bug_notes.md          # 4 类缺陷：现象、根因、改动点、复现、验证
+├── history_iter/         # 历史迭代版本 v1–v3，仅留档不参与运行
+├── collect.log           # 运行日志（256MB × 5 轮转，运行时生成）
+├── offline_cache.json    # MySQL 不可用时的离线缓存（运行时生成）
+├── normal_record.txt     # 采集明细记录（运行时生成）
+├── alarm_record.txt      # 告警记录（运行时生成）
+└── stat_record.txt       # 统计记录（运行时生成）
 ```
 
 ## 测试说明
@@ -57,7 +58,7 @@ edge-collect-gateway-demo
 ## RESTful API 接口说明
 基于 FastAPI 实现一套 RESTful 风格运维监控接口，用于网关运行状态查询、黑名单运维、健康探测，**不对外提供原始PLC数据写操作，仅支持查询与运维管理**。
 
-> 交互式接口文档地址：`http://127.0.0.1:8000/docs`，由 FastAPI 自动生成 Swagger 文档
+> 交互式接口文档地址：`http://127.0.0.1:8001/docs`，由 FastAPI 自动生成 Swagger 文档。服务监听 `0.0.0.0:8001`，注意不是 8000。
 
 ## 接口分类
 1. **健康检查接口**
@@ -99,10 +100,12 @@ CREATE DATABASE IF NOT EXISTS modbus_db
 mysql -u root -p modbus_db < schema.sql
 ```
 
-运行程序
+运行程序（必须在项目根目录执行，程序按 `src` 的上一级定位 `app.yaml`，日志也写在当前工作目录）
 ```bash
 python src/main.py
 ```
+
+启动时先做自检：MySQL 连接失败或缺表会直接退出（退出码 1）；Modbus 连接测试失败只告警不退出。自检通过后依次启动采集、消费、统计、健康巡检、内存监控与接口线程。停止用 `Ctrl+C` 或 `kill -TERM`，程序等待在途任务完成后退出，最长 10 秒，不要用 `kill -9`。
 
 ## 项目说明
 - 本项目为工业采集服务学习 Demo。
